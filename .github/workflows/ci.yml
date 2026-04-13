@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer ShellCheck
+        run: sudo apt-get install -y shellcheck
+
+      - name: Lancer ShellCheck sur tous les scripts
+        run: |
+          shellcheck mediadock
+          find lib/ -name '*.sh' -exec shellcheck {} +
+          find tests/helpers/ -name '*.bash' -exec shellcheck {} +
+
+  tests:
+    name: Tests bats-core
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer bats-core
+        run: |
+          git clone --branch v1.11.1 --depth 1 https://github.com/bats-core/bats-core.git /tmp/bats-core
+          sudo /tmp/bats-core/install.sh /usr/local
+
+      - name: Lancer les tests
+        run: bats --recursive tests/

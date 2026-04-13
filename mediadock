@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# MediaDock — CLI d'orchestration media server
+# Déploie un serveur multimédia complet en une seule commande
+
+readonly MEDIADOCK_VERSION="0.1.0"
+MEDIADOCK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly MEDIADOCK_DIR
+export MEDIADOCK_DIR
+
+mediadock_usage() {
+  cat <<'USAGE'
+MediaDock — Déploiement automatisé de media server
+
+Usage: mediadock <commande> [options]
+
+Commandes:
+  install     Déploiement complet sur un serveur Debian vierge
+  update      Mise à jour contrôlée des services
+  backup      Sauvegarde des configs et bases de données
+  restore     Restauration depuis un backup
+
+Options globales:
+  -v          Mode verbose (affiche tous les niveaux de log)
+  --help      Affiche cette aide
+  --version   Affiche la version de MediaDock
+USAGE
+}
+
+# Parsing des options globales
+VERBOSE=0
+export VERBOSE
+
+while [[ $# -gt 0 ]]; do
+  case "${1}" in
+    -v)
+      VERBOSE=1
+      shift
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+# Parsing des commandes
+if [[ $# -eq 0 ]]; then
+  mediadock_usage
+  exit 0
+fi
+
+case "${1}" in
+  --help|-h)
+    mediadock_usage
+    exit 0
+    ;;
+  --version)
+    echo "MediaDock v${MEDIADOCK_VERSION}"
+    exit 0
+    ;;
+  install|update|backup|restore)
+    echo "Commande '${1}' non encore implémentée."
+    exit 1
+    ;;
+  *)
+    echo "Erreur : commande '${1}' inconnue."
+    echo "Utilisez 'mediadock --help' pour voir les commandes disponibles."
+    exit 1
+    ;;
+esac

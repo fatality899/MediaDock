@@ -1,0 +1,10 @@
+# Forcer LF pour tous les scripts bash (exécutés sur Linux)
+*.sh text eol=lf
+*.bash text eol=lf
+*.bats text eol=lf
+mediadock text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+.env.example text eol=lf
+.shellcheckrc text eol=lf
+.gitignore text eol=lf
