@@ -32,6 +32,9 @@ USAGE
 VERBOSE=0
 export VERBOSE
 
+# Chargement des modules core
+source "${MEDIADOCK_DIR}/lib/core/logging.sh"
+
 while [[ $# -gt 0 ]]; do
   case "${1}" in
     -v)
@@ -43,6 +46,13 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# Initialisation du logging (apres parsing -v pour respecter VERBOSE)
+logging_init
+
+# Chargement du module de gestion d'erreurs
+source "${MEDIADOCK_DIR}/lib/core/errors.sh"
+errors_init
 
 # Parsing des commandes
 if [[ $# -eq 0 ]]; then

@@ -18,9 +18,9 @@ jobs:
 
       - name: Lancer ShellCheck sur tous les scripts
         run: |
-          shellcheck mediadock
-          find lib/ -name '*.sh' -exec shellcheck {} +
-          find tests/helpers/ -name '*.bash' -exec shellcheck {} +
+          shellcheck -x mediadock
+          find lib/ -name '*.sh' -exec shellcheck -x {} +
+          find tests/helpers/ -name '*.bash' -exec shellcheck -x {} +
 
   tests:
     name: Tests bats-core
