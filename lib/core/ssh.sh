@@ -68,6 +68,7 @@ ssh_exec() {
   log_debug "SSH exec: ${cmd}"
 
   local user="${SERVER_USER:-root}"
+  # shellcheck disable=SC2029 — expansion client-side intentionnelle, le caller formate la commande
   ssh "${_SSH_OPTS[@]}" "${user}@${SERVER_IP}" "$@"
 }
 
