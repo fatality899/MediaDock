@@ -11,8 +11,13 @@
 MEDIADOCK_LOG_DIR=""
 LOG_FILE=""
 
-# Initialise le systeme de logging : cree le repertoire et le fichier log horodate
+# Initialise le systeme de logging : cree le repertoire et le fichier log horodate.
+# Idempotent : si LOG_FILE est deja defini et existe, ne fait rien (evite de creer
+# un nouveau fichier a chaque appel et d'orpheliner les precedents).
 logging_init() {
+  if [[ -n "${LOG_FILE:-}" && -f "${LOG_FILE}" ]]; then
+    return 0
+  fi
   MEDIADOCK_LOG_DIR="${HOME}/.mediadock/logs"
   mkdir -p "${MEDIADOCK_LOG_DIR}"
   LOG_FILE="${MEDIADOCK_LOG_DIR}/mediadock-$(date '+%Y%m%d-%H%M%S').log"
@@ -54,7 +59,9 @@ log_action() {
 # Affiche une info detaillee (verbose uniquement, stdout)
 log_info() {
   local message="${1}"
-  if [[ "${VERBOSE:-0}" -eq 1 ]]; then
+  # Comparaison en chaine plutot que -eq : evite un crash d'arithmetique si
+  # VERBOSE vaut une chaine non-numerique (ex: VERBOSE=yes exporte par l'user).
+  if [[ "${VERBOSE:-0}" == "1" ]]; then
     printf '[INFO] %s\n' "${message}"
   fi
   _log_to_file "INFO" "${message}"
@@ -63,7 +70,7 @@ log_info() {
 # Affiche un message de debug (verbose uniquement, stdout)
 log_debug() {
   local message="${1}"
-  if [[ "${VERBOSE:-0}" -eq 1 ]]; then
+  if [[ "${VERBOSE:-0}" == "1" ]]; then
     printf '[DEBUG] %s\n' "${message}"
   fi
   _log_to_file "DEBUG" "${message}"

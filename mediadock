@@ -2,80 +2,176 @@
 set -euo pipefail
 
 # MediaDock — CLI d'orchestration media server
-# Déploie un serveur multimédia complet en une seule commande
+# Point d'entrée CLI : parse les options globales et dispatche vers les modules.
 
-readonly MEDIADOCK_VERSION="0.1.0"
+readonly VERSION="0.1.0"
+
 MEDIADOCK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly MEDIADOCK_DIR
 export MEDIADOCK_DIR
 
-mediadock_usage() {
+# Variables remplies par cli_parse_global_options
+VERBOSE=0
+SHOW_HELP=0
+SHOW_VERSION=0
+command=""
+remaining_args=()
+
+show_help() {
   cat <<'USAGE'
-MediaDock — Déploiement automatisé de media server
+MediaDock — CLI d'orchestration media server
 
-Usage: mediadock <commande> [options]
+Usage : mediadock [options] <commande> [args...]
 
-Commandes:
-  install     Déploiement complet sur un serveur Debian vierge
-  update      Mise à jour contrôlée des services
-  backup      Sauvegarde des configs et bases de données
-  restore     Restauration depuis un backup
+Options globales :
+  -v, --verbose          Afficher les logs detailles
+  -h, --help             Afficher cette aide
+  --version              Afficher la version
 
-Options globales:
-  -v          Mode verbose (affiche tous les niveaux de log)
-  --help      Affiche cette aide
-  --version   Affiche la version de MediaDock
+Commandes :
+  install                Deployer la stack complete sur un serveur
+  update                 Mettre a jour les services
+  backup                 Sauvegarder configurations et bases de donnees
+  restore                Restaurer depuis un backup
+
+Exemples :
+  mediadock install              # Installation interactive
+  mediadock install -v           # Installation en mode verbose
+  mediadock --help               # Afficher cette aide
+  mediadock --version            # Afficher la version
 USAGE
 }
 
-# Parsing des options globales
-VERBOSE=0
-export VERBOSE
+show_version() {
+  printf 'MediaDock version %s\n' "${VERSION}"
+}
 
-# Chargement des modules core
-source "${MEDIADOCK_DIR}/lib/core/logging.sh"
+# Parse les options globales et isole la commande + ses arguments.
+# Supporte -v/--verbose, -h/--help, --version placés avant OU après la commande.
+# Populations: VERBOSE, SHOW_HELP, SHOW_VERSION, command, remaining_args (tableau).
+cli_parse_global_options() {
+  VERBOSE=0
+  SHOW_HELP=0
+  SHOW_VERSION=0
+  command=""
+  remaining_args=()
 
-while [[ $# -gt 0 ]]; do
-  case "${1}" in
-    -v)
-      VERBOSE=1
-      shift
+  local arg
+  for arg in "$@"; do
+    case "${arg}" in
+      -v|--verbose)
+        VERBOSE=1
+        ;;
+      -h|--help)
+        SHOW_HELP=1
+        ;;
+      --version)
+        SHOW_VERSION=1
+        ;;
+      -*)
+        # errors.sh (die) n'est pas encore sourcé : fallback minimaliste.
+        printf 'mediadock: option inconnue : %s\n' "${arg}" >&2
+        printf "Utilisez 'mediadock --help' pour l'aide\n" >&2
+        exit 1
+        ;;
+      *)
+        if [[ -z "${command}" ]]; then
+          command="${arg}"
+        else
+          remaining_args+=("${arg}")
+        fi
+        ;;
+    esac
+  done
+  export VERBOSE
+}
+
+# Charge un module fonctionnel en verifiant qu'il existe, avec un message d'erreur
+# lisible plutot que l'erreur bash brute si le fichier manque.
+_cli_source_module() {
+  local module_path="${1}"
+  if [[ ! -f "${module_path}" ]]; then
+    die 1 "Module introuvable : ${module_path}" "Verifiez l'integrite de l'installation MediaDock"
+  fi
+  # shellcheck source=/dev/null
+  source "${module_path}"
+}
+
+# Dispatche la commande parsée vers la fonction d'entrée du module correspondant.
+# Prérequis: les modules core sont sourcés (die/log_* disponibles).
+cli_dispatch() {
+  local cmd="${1:-}"
+  shift || true
+
+  case "${cmd}" in
+    install)
+      _cli_source_module "${MEDIADOCK_DIR}/lib/modules/hardening.sh"
+      hardening_run "$@"
+      ;;
+    update)
+      _cli_source_module "${MEDIADOCK_DIR}/lib/modules/update.sh"
+      update_run "$@"
+      ;;
+    backup)
+      _cli_source_module "${MEDIADOCK_DIR}/lib/modules/backup.sh"
+      backup_run "$@"
+      ;;
+    restore)
+      _cli_source_module "${MEDIADOCK_DIR}/lib/modules/backup.sh"
+      backup_restore "$@"
+      ;;
+    help|--help|-h)
+      show_help
       ;;
     *)
-      break
+      die 1 "Commande inconnue : ${cmd}" "Utilisez 'mediadock --help' pour voir les commandes disponibles"
       ;;
   esac
-done
+}
 
-# Initialisation du logging (apres parsing -v pour respecter VERBOSE)
-logging_init
+# ---------------------------------------------------------------------------
+# Point d'entrée
+# ---------------------------------------------------------------------------
 
-# Chargement du module de gestion d'erreurs
-source "${MEDIADOCK_DIR}/lib/core/errors.sh"
-errors_init
+cli_parse_global_options "$@"
 
-# Parsing des commandes
-if [[ $# -eq 0 ]]; then
-  mediadock_usage
+# --help prime sur --version (convention GNU).
+if [[ "${SHOW_HELP}" -eq 1 ]]; then
+  show_help
+  exit 0
+fi
+if [[ "${SHOW_VERSION}" -eq 1 ]]; then
+  show_version
   exit 0
 fi
 
-case "${1}" in
-  --help|-h)
-    mediadock_usage
-    exit 0
-    ;;
-  --version)
-    echo "MediaDock v${MEDIADOCK_VERSION}"
-    exit 0
-    ;;
-  install|update|backup|restore)
-    echo "Commande '${1}' non encore implémentée."
-    exit 1
-    ;;
-  *)
-    echo "Erreur : commande '${1}' inconnue."
-    echo "Utilisez 'mediadock --help' pour voir les commandes disponibles."
-    exit 1
-    ;;
-esac
+# Sourcing ordonné des modules core : logging → errors → utils → ssh → config.
+# shellcheck source=lib/core/logging.sh
+source "${MEDIADOCK_DIR}/lib/core/logging.sh"
+logging_init
+
+# shellcheck source=lib/core/errors.sh
+source "${MEDIADOCK_DIR}/lib/core/errors.sh"
+errors_init
+
+# shellcheck source=lib/core/utils.sh
+source "${MEDIADOCK_DIR}/lib/core/utils.sh"
+# shellcheck source=lib/core/ssh.sh
+source "${MEDIADOCK_DIR}/lib/core/ssh.sh"
+# shellcheck source=lib/core/config.sh
+source "${MEDIADOCK_DIR}/lib/core/config.sh"
+
+# Garantit le nettoyage de la connexion SSH ControlMaster meme en cas
+# d'interruption (Ctrl-C), de SIGTERM, ou d'erreur non anticipee capturee
+# par trap ERR. ssh_cleanup est idempotent et no-op si aucune connexion
+# n'a ete initialisee.
+trap 'ssh_cleanup || true' EXIT INT TERM
+
+# Aucune commande -> aide par défaut (AC1).
+if [[ -z "${command}" ]]; then
+  show_help
+  exit 0
+fi
+
+# Dispatch (support sûr d'un tableau vide sous set -u).
+cli_dispatch "${command}" ${remaining_args[@]+"${remaining_args[@]}"}

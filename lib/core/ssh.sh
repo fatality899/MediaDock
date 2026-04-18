@@ -35,6 +35,12 @@ ssh_init() {
   _SSH_SOCKET_DIR="$(mktemp -d /tmp/mediadock-ssh-XXXX)"
   _SSH_SOCKET="${_SSH_SOCKET_DIR}/control"
 
+  # Nettoyage preventif du repertoire de socket en cas d'interruption pendant
+  # la phase de connexion (SIGINT/SIGTERM entre mktemp et le succes du probe).
+  # Retire apres succes pour laisser ssh_cleanup gerer l'etat stable.
+  # shellcheck disable=SC2064
+  trap "rm -rf '${_SSH_SOCKET_DIR}'" INT TERM
+
   _SSH_OPTS=(
     -o "ControlMaster=auto"
     -o "ControlPath=${_SSH_SOCKET}"
@@ -49,27 +55,40 @@ ssh_init() {
 
   if ! ssh "${_SSH_OPTS[@]}" -o "ControlMaster=yes" "${user}@${SERVER_IP}" true 2>/dev/null; then
     rm -rf "${_SSH_SOCKET_DIR}"
+    trap - INT TERM
     die 2 "Connexion SSH echouee vers ${SERVER_IP}" "Verifiez l'adresse IP et la cle SSH (${SSH_KEY_PATH})"
   fi
 
+  trap - INT TERM
   _SSH_INITIALIZED=1
   log_info "Connexion SSH etablie (ControlMaster)"
 }
 
 # Execute une commande sur le serveur distant via la connexion ControlMaster
-# Arguments: $@ = commande a executer
+# Arguments: $@ = commande a executer (assemblee comme une chaine shell cote distant)
 # Retourne: stdout de la commande distante, propage le code de retour
+#
+# Contrat de l'API :
+#  - L'appelant passe la commande a executer ; les arguments sont concatenes
+#    par ssh puis re-interpretes par le shell distant. L'appelant est
+#    responsable du quoting multi-tokens (ex: ssh_exec "rm '/path with spaces'").
+#  - Pour les arguments contenant des donnees utilisateur non fiables, utilisez
+#    printf '%q' cote appelant avant de les inclure dans la commande.
 ssh_exec() {
   if [[ "${_SSH_INITIALIZED}" -ne 1 ]]; then
     die 2 "SSH non initialise" "Appelez ssh_init avant ssh_exec"
   fi
+  if [[ $# -eq 0 ]]; then
+    die 2 "ssh_exec : commande manquante"
+  fi
 
-  local cmd="$*"
-  log_debug "SSH exec: ${cmd}"
+  # Ne logge que le nom de la commande (premier token), pas les arguments :
+  # evite la fuite de secrets (tokens, mots de passe) dans ~/.mediadock/logs/.
+  log_debug "SSH exec: ${1%% *}"
 
   local user="${SERVER_USER:-root}"
   # shellcheck disable=SC2029
-  ssh "${_SSH_OPTS[@]}" "${user}@${SERVER_IP}" "$@"
+  ssh "${_SSH_OPTS[@]}" -- "${user}@${SERVER_IP}" "$@"
 }
 
 # Copie un fichier local vers le serveur distant via scp
@@ -93,10 +112,17 @@ ssh_copy() {
     die 1 "Fichier source introuvable : ${source}"
   fi
 
+  # scp interprete la destination cote distant via le shell : rejeter les
+  # metacaracteres qui permettraient une injection de commande (RCE via
+  # `;`, `$()`, backticks, `|`, `<`, `>`, `&`, `(`, `)`, newlines).
+  if [[ "${destination}" =~ [\;\$\`\|\<\>\&\(\)]|$'\n' ]]; then
+    die 1 "ssh_copy : destination contient des caracteres dangereux : ${destination}"
+  fi
+
   log_debug "SSH copy: ${source} -> ${destination}"
 
   local user="${SERVER_USER:-root}"
-  scp -o "ControlPath=${_SSH_SOCKET}" -o "BatchMode=yes" -o "ConnectTimeout=10" -i "${SSH_KEY_PATH}" "${source}" "${user}@${SERVER_IP}:${destination}"
+  scp -o "ControlPath=${_SSH_SOCKET}" -o "BatchMode=yes" -o "ConnectTimeout=10" -i "${SSH_KEY_PATH}" -- "${source}" "${user}@${SERVER_IP}:${destination}"
 }
 
 # Ferme la connexion ControlMaster et nettoie les fichiers temporaires

@@ -3,5 +3,7 @@
 # Dépendances: logging.sh, errors.sh, ssh.sh, utils.sh
 
 hardening_run() {
-  :  # TODO: Story future
+  log_info "Mode verbose actif"
+  log_action "Commande install non encore implémentée (Epic 2)"
+  return 0
 }
