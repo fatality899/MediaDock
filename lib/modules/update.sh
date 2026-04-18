@@ -3,5 +3,7 @@
 # Dépendances: logging.sh, errors.sh, ssh.sh, utils.sh
 
 update_run() {
-  :  # TODO: Story future
+  log_info "Mode verbose actif"
+  log_action "Commande update non encore implémentée (Epic 4)"
+  return 0
 }

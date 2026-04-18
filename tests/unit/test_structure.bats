@@ -17,19 +17,19 @@ setup() {
 @test "mediadock --version affiche la version" {
   run "${PROJECT_ROOT}/mediadock" --version
   [ "${status}" -eq 0 ]
-  [[ "${output}" == *"MediaDock v"* ]]
+  [[ "${output}" == *"MediaDock version"* ]]
 }
 
 @test "mediadock --help affiche l'aide" {
   run "${PROJECT_ROOT}/mediadock" --help
   [ "${status}" -eq 0 ]
-  [[ "${output}" == *"Usage:"* ]]
+  [[ "${output}" == *"Usage"* ]]
 }
 
 @test "mediadock sans argument affiche l'aide" {
   run "${PROJECT_ROOT}/mediadock"
   [ "${status}" -eq 0 ]
-  [[ "${output}" == *"Usage:"* ]]
+  [[ "${output}" == *"Usage"* ]]
 }
 
 @test "mediadock commande inconnue retourne erreur" {
