@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Module: storage — Détection disque, structure TRaSH, UID/GID
-# Dépendances: logging.sh, errors.sh, ssh.sh, utils.sh
+# Module: storage — Detection disque, structure TRaSH, UID/GID
+# Dependances: logging.sh, errors.sh, ssh.sh, utils.sh
 
 storage_run() {
-  :  # TODO: Story future
+  log_action "Stockage — stub (implementation : Stories 2.6 a 2.7)"
+  return 0
 }
