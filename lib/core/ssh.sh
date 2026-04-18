@@ -57,19 +57,30 @@ ssh_init() {
 }
 
 # Execute une commande sur le serveur distant via la connexion ControlMaster
-# Arguments: $@ = commande a executer
+# Arguments: $@ = commande a executer (assemblee comme une chaine shell cote distant)
 # Retourne: stdout de la commande distante, propage le code de retour
+#
+# Contrat de l'API :
+#  - L'appelant passe la commande a executer ; les arguments sont concatenes
+#    par ssh puis re-interpretes par le shell distant. L'appelant est
+#    responsable du quoting multi-tokens (ex: ssh_exec "rm '/path with spaces'").
+#  - Pour les arguments contenant des donnees utilisateur non fiables, utilisez
+#    printf '%q' cote appelant avant de les inclure dans la commande.
 ssh_exec() {
   if [[ "${_SSH_INITIALIZED}" -ne 1 ]]; then
     die 2 "SSH non initialise" "Appelez ssh_init avant ssh_exec"
   fi
+  if [[ $# -eq 0 ]]; then
+    die 2 "ssh_exec : commande manquante"
+  fi
 
-  local cmd="$*"
-  log_debug "SSH exec: ${cmd}"
+  # Ne logge que le nom de la commande (premier token), pas les arguments :
+  # evite la fuite de secrets (tokens, mots de passe) dans ~/.mediadock/logs/.
+  log_debug "SSH exec: ${1%% *}"
 
   local user="${SERVER_USER:-root}"
   # shellcheck disable=SC2029
-  ssh "${_SSH_OPTS[@]}" "${user}@${SERVER_IP}" "$@"
+  ssh "${_SSH_OPTS[@]}" -- "${user}@${SERVER_IP}" "$@"
 }
 
 # Copie un fichier local vers le serveur distant via scp
@@ -93,10 +104,17 @@ ssh_copy() {
     die 1 "Fichier source introuvable : ${source}"
   fi
 
+  # scp interprete la destination cote distant via le shell : rejeter les
+  # metacaracteres qui permettraient une injection de commande (RCE via
+  # `;`, `$()`, backticks, `|`, `<`, `>`, `&`, `(`, `)`, newlines).
+  if [[ "${destination}" =~ [\;\$\`\|\<\>\&\(\)]|$'\n' ]]; then
+    die 1 "ssh_copy : destination contient des caracteres dangereux : ${destination}"
+  fi
+
   log_debug "SSH copy: ${source} -> ${destination}"
 
   local user="${SERVER_USER:-root}"
-  scp -o "ControlPath=${_SSH_SOCKET}" -o "BatchMode=yes" -o "ConnectTimeout=10" -i "${SSH_KEY_PATH}" "${source}" "${user}@${SERVER_IP}:${destination}"
+  scp -o "ControlPath=${_SSH_SOCKET}" -o "BatchMode=yes" -o "ConnectTimeout=10" -i "${SSH_KEY_PATH}" -- "${source}" "${user}@${SERVER_IP}:${destination}"
 }
 
 # Ferme la connexion ControlMaster et nettoie les fichiers temporaires
