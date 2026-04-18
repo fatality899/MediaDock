@@ -54,9 +54,12 @@ unexpected_error() {
   exit "${exit_code}"
 }
 
-# Initialise le trap ERR pour capturer les erreurs non anticipees
-# set -E (errtrace) permet au trap ERR d'etre herite par les fonctions et sous-shells
+# Initialise le trap ERR pour capturer les erreurs non anticipees.
+# set -E (errtrace) permet au trap ERR d'etre herite par les fonctions et sous-shells.
+# set -o pipefail garantit que les erreurs au milieu d'un pipeline remontent
+# (sans pipefail, `false | true` passe silencieusement et le trap ne se declenche pas).
 errors_init() {
   set -E
+  set -o pipefail
   trap 'unexpected_error "${LINENO}" "${BASH_SOURCE[0]:-unknown}" "${BASH_COMMAND:-unknown}"' ERR
 }

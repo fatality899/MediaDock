@@ -35,6 +35,12 @@ ssh_init() {
   _SSH_SOCKET_DIR="$(mktemp -d /tmp/mediadock-ssh-XXXX)"
   _SSH_SOCKET="${_SSH_SOCKET_DIR}/control"
 
+  # Nettoyage preventif du repertoire de socket en cas d'interruption pendant
+  # la phase de connexion (SIGINT/SIGTERM entre mktemp et le succes du probe).
+  # Retire apres succes pour laisser ssh_cleanup gerer l'etat stable.
+  # shellcheck disable=SC2064
+  trap "rm -rf '${_SSH_SOCKET_DIR}'" INT TERM
+
   _SSH_OPTS=(
     -o "ControlMaster=auto"
     -o "ControlPath=${_SSH_SOCKET}"
@@ -49,9 +55,11 @@ ssh_init() {
 
   if ! ssh "${_SSH_OPTS[@]}" -o "ControlMaster=yes" "${user}@${SERVER_IP}" true 2>/dev/null; then
     rm -rf "${_SSH_SOCKET_DIR}"
+    trap - INT TERM
     die 2 "Connexion SSH echouee vers ${SERVER_IP}" "Verifiez l'adresse IP et la cle SSH (${SSH_KEY_PATH})"
   fi
 
+  trap - INT TERM
   _SSH_INITIALIZED=1
   log_info "Connexion SSH etablie (ControlMaster)"
 }

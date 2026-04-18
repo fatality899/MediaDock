@@ -86,6 +86,17 @@ cli_parse_global_options() {
   export VERBOSE
 }
 
+# Charge un module fonctionnel en verifiant qu'il existe, avec un message d'erreur
+# lisible plutot que l'erreur bash brute si le fichier manque.
+_cli_source_module() {
+  local module_path="${1}"
+  if [[ ! -f "${module_path}" ]]; then
+    die 1 "Module introuvable : ${module_path}" "Verifiez l'integrite de l'installation MediaDock"
+  fi
+  # shellcheck source=/dev/null
+  source "${module_path}"
+}
+
 # Dispatche la commande parsée vers la fonction d'entrée du module correspondant.
 # Prérequis: les modules core sont sourcés (die/log_* disponibles).
 cli_dispatch() {
@@ -94,23 +105,19 @@ cli_dispatch() {
 
   case "${cmd}" in
     install)
-      # shellcheck source=lib/modules/hardening.sh
-      source "${MEDIADOCK_DIR}/lib/modules/hardening.sh"
+      _cli_source_module "${MEDIADOCK_DIR}/lib/modules/hardening.sh"
       hardening_run "$@"
       ;;
     update)
-      # shellcheck source=lib/modules/update.sh
-      source "${MEDIADOCK_DIR}/lib/modules/update.sh"
+      _cli_source_module "${MEDIADOCK_DIR}/lib/modules/update.sh"
       update_run "$@"
       ;;
     backup)
-      # shellcheck source=lib/modules/backup.sh
-      source "${MEDIADOCK_DIR}/lib/modules/backup.sh"
+      _cli_source_module "${MEDIADOCK_DIR}/lib/modules/backup.sh"
       backup_run "$@"
       ;;
     restore)
-      # shellcheck source=lib/modules/backup.sh
-      source "${MEDIADOCK_DIR}/lib/modules/backup.sh"
+      _cli_source_module "${MEDIADOCK_DIR}/lib/modules/backup.sh"
       backup_restore "$@"
       ;;
     help|--help|-h)
@@ -153,6 +160,12 @@ source "${MEDIADOCK_DIR}/lib/core/utils.sh"
 source "${MEDIADOCK_DIR}/lib/core/ssh.sh"
 # shellcheck source=lib/core/config.sh
 source "${MEDIADOCK_DIR}/lib/core/config.sh"
+
+# Garantit le nettoyage de la connexion SSH ControlMaster meme en cas
+# d'interruption (Ctrl-C), de SIGTERM, ou d'erreur non anticipee capturee
+# par trap ERR. ssh_cleanup est idempotent et no-op si aucune connexion
+# n'a ete initialisee.
+trap 'ssh_cleanup || true' EXIT INT TERM
 
 # Aucune commande -> aide par défaut (AC1).
 if [[ -z "${command}" ]]; then

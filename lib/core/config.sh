@@ -257,8 +257,14 @@ interactive_setup() {
 
   # Generation du .env avec quoting shell-safe (printf %q) pour supporter
   # les valeurs contenant des espaces, #, $, backticks, quotes, etc.
-  local generated_date
+  #
+  # Ecriture atomique : toutes les sections sont ecrites dans un fichier
+  # temporaire puis mv -f une seule fois. Evite de laisser un .env partiel
+  # (missing LANGUAGE/QUALITY/BACKUP) si le processus est interrompu en cours.
+  local generated_date tmp_env
   generated_date="$(date +%Y-%m-%d)"
+  tmp_env="${env_file}.tmp.$$"
+
   {
     printf '# =============================================================================\n'
     printf '# MediaDock — Configuration\n'
@@ -283,13 +289,9 @@ interactive_setup() {
     printf '# --- Stockage ---\n'
     printf '# Mode : dedicated_disk | single_disk\n'
     printf 'STORAGE_MODE=%q\n' "${STORAGE_MODE}"
-  } > "${env_file}"
-
-  if [[ "${STORAGE_MODE}" == "dedicated_disk" ]]; then
-    printf 'DATA_DISK=%q\n' "${DATA_DISK}" >> "${env_file}"
-  fi
-
-  {
+    if [[ "${STORAGE_MODE}" == "dedicated_disk" ]]; then
+      printf 'DATA_DISK=%q\n' "${DATA_DISK}"
+    fi
     printf '\n'
     printf '# --- Langue et qualite ---\n'
     printf 'LANGUAGE=%q\n' "${LANGUAGE}"
@@ -300,7 +302,11 @@ interactive_setup() {
     printf '# Frequence : daily | weekly | monthly\n'
     printf 'BACKUP_SCHEDULE=weekly\n'
     printf 'BACKUP_PATH=/opt/mediadock/backups\n'
-  } >> "${env_file}"
+  } > "${tmp_env}"
+
+  # Commit atomique : si SIGINT intervient avant, tmp_env est orphelin mais
+  # env_file existant (ou absent) reste coherent.
+  mv -f "${tmp_env}" "${env_file}"
 
   # Belt-and-suspenders : le umask 077 a deja cree le fichier en 600.
   chmod 600 "${env_file}" 2>/dev/null || true
