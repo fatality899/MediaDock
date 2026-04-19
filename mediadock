@@ -105,8 +105,8 @@ cli_dispatch() {
 
   case "${cmd}" in
     install)
-      _cli_source_module "${MEDIADOCK_DIR}/lib/modules/hardening.sh"
-      hardening_run "$@"
+      _cli_source_module "${MEDIADOCK_DIR}/lib/modules/install.sh"
+      install_run "$@"
       ;;
     update)
       _cli_source_module "${MEDIADOCK_DIR}/lib/modules/update.sh"
