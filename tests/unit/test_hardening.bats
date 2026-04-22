@@ -1,18 +1,20 @@
 #!/usr/bin/env bats
-# Tests unitaires — Module hardening (Stories 2.2 + 2.3)
+# Tests unitaires — Module hardening (Stories 2.2 + 2.3 + 2.4)
 #
 # Strategie : sourcer hardening.sh en isolation avec ssh_exec stube,
 # pour valider hardening_configure_ssh (idempotence, ecriture + reload,
-# rollback sur echec sshd -t, traces log) ET hardening_configure_fail2ban
+# rollback sur echec sshd -t, traces log), hardening_configure_fail2ban
 # (idempotence effective, install + drop-in + enable + reload, die sans
-# rollback sur echec reload, cablage hardening_run) sans serveur SSH reel.
+# rollback sur echec reload, cablage hardening_run) ET hardening_configure_ufw
+# (idempotence, 7 etapes install + regles LAN, invariant allow 22/tcp AVANT
+# --force enable, cablage hardening_run a 3 helpers) sans serveur SSH reel.
 #
 # Persistance via fichier CALL_LOG : les tests avec `run` executent en
 # sous-shell, les variables ne survivent pas mais un fichier si. Les
 # codes de retour du stub sont configurables via variables d'env
 # SSH_EXEC_*_RC (permet de simuler sshd -T conforme / non conforme,
 # sshd -t valide / invalide, paquet fail2ban absent / valeurs non
-# conformes, etc.).
+# conformes, paquet ufw absent / regles UFW en echec, etc.).
 
 setup() {
   _ORIG_HOME="${HOME:-}"
@@ -49,7 +51,7 @@ setup() {
   # Stub fail2ban : defaut check echoue → action declenchee ; tout
   # le reste passe. Chaque RC pilote un sous-motif distinct.
   export SSH_EXEC_F2B_CHECK_RC=1        # dpkg -s fail2ban && ... (check chaine)
-  export SSH_EXEC_F2B_UPDATE_RC=0       # apt-get update
+  export SSH_EXEC_F2B_UPDATE_RC=0       # apt-get update (partage UFW/F2B - voir stub)
   export SSH_EXEC_F2B_INSTALL_RC=0      # apt-get install -y ... fail2ban
   export SSH_EXEC_F2B_CAT_RC=0          # cat > /etc/fail2ban/...
   export SSH_EXEC_F2B_ENABLE_RC=0       # systemctl enable --now fail2ban
@@ -57,18 +59,50 @@ setup() {
   export SSH_EXEC_F2B_RELOAD_RC=0       # fail2ban-client reload
   export SSH_EXEC_F2B_RM_RC=0           # rm -f tmp fail2ban (cleanup)
 
+  # Stub UFW (Story 2.4) : defaut check echoue → action declenchee.
+  # Le check UFW commence par `dpkg -s ufw` (matche UFW_CHECK_RC avant f2b).
+  # `apt-get update` est partage avec fail2ban (meme commande, meme pattern) :
+  # le stub priorise UFW_UPDATE_RC si non-nul, sinon tombe sur F2B_UPDATE_RC.
+  export SSH_EXEC_UFW_CHECK_RC=1        # dpkg -s ufw && ... (check chaine UFW)
+  export SSH_EXEC_UFW_UPDATE_RC=0       # apt-get update (priorise sur F2B si !=0)
+  export SSH_EXEC_UFW_INSTALL_RC=0      # apt-get install -y ... ufw
+  export SSH_EXEC_UFW_DEFAULT_RC=0      # ufw default deny incoming && ... && deny routed
+  export SSH_EXEC_UFW_ALLOW_SSH_RC=0    # ufw allow 22/tcp (invariant anti-lockout)
+  export SSH_EXEC_UFW_ALLOW_LAN_RC=0    # set -e; ufw allow from <CIDR> ... (30 regles)
+  export SSH_EXEC_UFW_ENABLE_RC=0       # ufw --force enable
+  export SSH_EXEC_UFW_SYSTEMCTL_RC=0    # systemctl enable ufw
+
   # Stub ssh_exec : log la commande dans CALL_LOG et retourne un code
-  # configurable selon le motif detecte. Les patterns fail2ban sont
-  # testes AVANT les patterns SSH generiques (ex. cat > /etc/fail2ban/
-  # doit matcher f2b, pas le cat SSH). `fail2ban-client -t` avant
-  # `fail2ban-client reload` pour match le bon RC.
+  # configurable selon le motif detecte. Ordre de matching critique :
+  #   1. UFW d'abord (le check UFW commence par `dpkg -s ufw` - unique)
+  #   2. Fail2ban ensuite
+  #   3. SSH en dernier
+  # Patterns UFW places AVANT f2b pour eviter les collisions (ex:
+  # `systemctl is-active --quiet ufw` ne matche PAS le pattern f2b
+  # `systemctl is-active --quiet fail2ban` mais on garde l'ordre strict
+  # par souci de coherence avec la convention UFW-first.
   ssh_exec() {
     local cmd="$*"
     printf 'ssh_exec: %s\n' "${cmd}" >> "${CALL_LOG}"
     case "${cmd}" in
-      # --- Fail2ban (plus specifiques : ordre important) ---
+      # --- UFW (plus specifiques, ordre critique : check -> install -> default -> allow 22/tcp -> allow from -> enable -> systemctl enable ufw) ---
+      *"dpkg -s ufw"*)                          return "${SSH_EXEC_UFW_CHECK_RC}" ;;
+      *"apt-get install"*"ufw"*)                return "${SSH_EXEC_UFW_INSTALL_RC}" ;;
+      *"ufw default"*)                          return "${SSH_EXEC_UFW_DEFAULT_RC}" ;;
+      *"ufw allow 22/tcp"*)                     return "${SSH_EXEC_UFW_ALLOW_SSH_RC}" ;;
+      *"ufw allow from"*)                       return "${SSH_EXEC_UFW_ALLOW_LAN_RC}" ;;
+      *"ufw --force enable"*)                   return "${SSH_EXEC_UFW_ENABLE_RC}" ;;
+      *"systemctl enable ufw"*)                 return "${SSH_EXEC_UFW_SYSTEMCTL_RC}" ;;
+
+      # --- Fail2ban ---
       *"dpkg -s fail2ban"*)                 return "${SSH_EXEC_F2B_CHECK_RC}" ;;
-      *"apt-get update"*)                   return "${SSH_EXEC_F2B_UPDATE_RC}" ;;
+      # apt-get update partage UFW/F2B : UFW_UPDATE_RC priorise si non-nul.
+      *"apt-get update"*)
+        if [ "${SSH_EXEC_UFW_UPDATE_RC:-0}" -ne 0 ]; then
+          return "${SSH_EXEC_UFW_UPDATE_RC}"
+        fi
+        return "${SSH_EXEC_F2B_UPDATE_RC}"
+        ;;
       *"apt-get install"*"fail2ban"*)       return "${SSH_EXEC_F2B_INSTALL_RC}" ;;
       *"systemctl enable --now fail2ban"*)  return "${SSH_EXEC_F2B_ENABLE_RC}" ;;
       *"fail2ban-client -t"*)               return "${SSH_EXEC_F2B_TEST_RC}" ;;
@@ -94,6 +128,9 @@ teardown() {
   unset SSH_EXEC_SSHD_T_RC SSH_EXEC_SSHD_VALIDATE_RC SSH_EXEC_WRITE_RC SSH_EXEC_RELOAD_RC SSH_EXEC_RM_RC
   unset SSH_EXEC_F2B_CHECK_RC SSH_EXEC_F2B_UPDATE_RC SSH_EXEC_F2B_INSTALL_RC
   unset SSH_EXEC_F2B_CAT_RC SSH_EXEC_F2B_ENABLE_RC SSH_EXEC_F2B_TEST_RC SSH_EXEC_F2B_RELOAD_RC SSH_EXEC_F2B_RM_RC
+  unset SSH_EXEC_UFW_CHECK_RC SSH_EXEC_UFW_UPDATE_RC SSH_EXEC_UFW_INSTALL_RC
+  unset SSH_EXEC_UFW_DEFAULT_RC SSH_EXEC_UFW_ALLOW_SSH_RC SSH_EXEC_UFW_ALLOW_LAN_RC
+  unset SSH_EXEC_UFW_ENABLE_RC SSH_EXEC_UFW_SYSTEMCTL_RC
 }
 
 # ---------------------------------------------------------------------------
@@ -195,22 +232,27 @@ teardown() {
 }
 
 # ---------------------------------------------------------------------------
-# Story 2.2 AC4 + Story 2.3 AC4 — hardening_run orchestre ssh puis fail2ban
+# Story 2.4 AC4 — hardening_run orchestre ssh -> fail2ban -> ufw, dans cet ordre
+# (etend l'ancien Story 2.3 AC4 a 3 helpers)
 # ---------------------------------------------------------------------------
 
-@test "Story 2.3 AC4 : hardening_run appelle ssh puis fail2ban, dans cet ordre" {
-  # Stubbe les deux helpers pour tracer l'ordre d'invocation
+@test "Story 2.4 AC4 : hardening_run appelle ssh puis fail2ban puis ufw, dans cet ordre" {
+  # Stubbe les trois helpers pour tracer l'ordre d'invocation
   hardening_configure_ssh()      { echo "hardening_configure_ssh" >> "${CALL_LOG}"; }
   hardening_configure_fail2ban() { echo "hardening_configure_fail2ban" >> "${CALL_LOG}"; }
+  hardening_configure_ufw()      { echo "hardening_configure_ufw" >> "${CALL_LOG}"; }
   run hardening_run
   [ "${status}" -eq 0 ]
   grep -q '^hardening_configure_ssh$' "${CALL_LOG}"
   grep -q '^hardening_configure_fail2ban$' "${CALL_LOG}"
-  # Ordre : SSH en premier (ligne contenant ssh avant ligne contenant fail2ban)
-  local ssh_line f2b_line
+  grep -q '^hardening_configure_ufw$' "${CALL_LOG}"
+  # Ordre strict : SSH -> fail2ban -> UFW (anti-lockout : UFW apres f2b)
+  local ssh_line f2b_line ufw_line
   ssh_line=$(grep -n '^hardening_configure_ssh$' "${CALL_LOG}" | cut -d: -f1)
   f2b_line=$(grep -n '^hardening_configure_fail2ban$' "${CALL_LOG}" | cut -d: -f1)
+  ufw_line=$(grep -n '^hardening_configure_ufw$' "${CALL_LOG}" | cut -d: -f1)
   [ "${ssh_line}" -lt "${f2b_line}" ]
+  [ "${f2b_line}" -lt "${ufw_line}" ]
   # Le message stub de 2.1 ne doit plus apparaitre
   [[ "${output}" != *"Hardening — stub"* ]]
 }
@@ -427,6 +469,255 @@ teardown() {
   [[ "${output}" != *"échoué"* ]]
 }
 
+# ===========================================================================
+# STORY 2.4 — Firewall UFW
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Story 2.4 AC1 — Cas nominal : check echoue -> 7 etapes (update, install,
+# default x3, allow 22/tcp, allow from CIDR x ports, --force enable,
+# systemctl enable ufw) dans l'ordre
+# ---------------------------------------------------------------------------
+
+@test "Story 2.4 AC1 : hardening_configure_ufw execute les 7 etapes dans l'ordre" {
+  export SSH_EXEC_UFW_CHECK_RC=1  # etat non conforme -> action
+  run hardening_configure_ufw
+  [ "${status}" -eq 0 ]
+  # Les 7 etapes attendues apparaissent dans CALL_LOG
+  grep -qE 'ssh_exec: apt-get update( |$)' "${CALL_LOG}"
+  grep -q 'ssh_exec: DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold ufw' "${CALL_LOG}"
+  grep -q 'ssh_exec: ufw default deny incoming && ufw default allow outgoing && ufw default deny routed' "${CALL_LOG}"
+  grep -q 'ssh_exec: ufw allow 22/tcp' "${CALL_LOG}"
+  grep -q 'ssh_exec: set -e; ufw allow from ' "${CALL_LOG}"
+  grep -q 'ssh_exec: ufw --force enable' "${CALL_LOG}"
+  grep -q 'ssh_exec: systemctl enable ufw' "${CALL_LOG}"
+}
+
+@test "Story 2.4 AC1 (INVARIANT ANTI-LOCKOUT) : ufw allow 22/tcp AVANT ufw --force enable" {
+  export SSH_EXEC_UFW_CHECK_RC=1
+  run hardening_configure_ufw
+  [ "${status}" -eq 0 ]
+  # Comparaison de numeros de lignes : allow SSH doit etre STRICTEMENT avant enable.
+  local allow_ssh_line enable_line
+  allow_ssh_line=$(grep -n 'ssh_exec: ufw allow 22/tcp' "${CALL_LOG}" | cut -d: -f1)
+  enable_line=$(grep -n 'ssh_exec: ufw --force enable' "${CALL_LOG}" | cut -d: -f1)
+  [ -n "${allow_ssh_line}" ] && [ -n "${enable_line}" ]
+  [ "${allow_ssh_line}" -lt "${enable_line}" ]
+}
+
+@test "Story 2.4 AC1 : toutes les 30 regles LAN (3 CIDRs x 10 ports) sont presentes" {
+  export SSH_EXEC_UFW_CHECK_RC=1
+  run hardening_configure_ufw
+  [ "${status}" -eq 0 ]
+  # Les 30 regles sont concatenees dans UN seul ssh_exec (set -e; ufw allow ...).
+  # On extrait la ligne CALL_LOG correspondante et on verifie chaque combinaison.
+  local cidr port
+  for cidr in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+    for port in 7878 8989 9696 8080 5055 8191 7575 8888 8096 32400; do
+      grep -qF "ufw allow from ${cidr} to any port ${port} proto tcp" "${CALL_LOG}" \
+        || { echo "Regle manquante : ${cidr}:${port}"; return 1; }
+    done
+  done
+}
+
+@test "Story 2.4 AC1 : apt-get install ufw utilise --force-conf{def,old} (heritage patch 2.3)" {
+  export SSH_EXEC_UFW_CHECK_RC=1
+  run hardening_configure_ufw
+  [ "${status}" -eq 0 ]
+  grep -q '\-o Dpkg::Options::=--force-confdef' "${CALL_LOG}"
+  grep -q '\-o Dpkg::Options::=--force-confold' "${CALL_LOG}"
+}
+
+@test "Story 2.4 AC1 : apt-get update est invoque SANS -qq (heritage patch 2.3)" {
+  export SSH_EXEC_UFW_CHECK_RC=1
+  run hardening_configure_ufw
+  [ "${status}" -eq 0 ]
+  # Vu que -qq n'est jamais passe par UFW ni F2B (coherence patch 2.3)
+  ! grep -q 'ssh_exec: apt-get update -qq' "${CALL_LOG}"
+  grep -qE 'ssh_exec: apt-get update( |$)' "${CALL_LOG}"
+}
+
+# ---------------------------------------------------------------------------
+# Story 2.4 AC2 / AC3 — Idempotence : check effectif conforme -> aucune action
+# ---------------------------------------------------------------------------
+
+@test "Story 2.4 AC2/AC3 : si l'etat effectif est deja conforme, aucune action (pas d'apt/ufw/systemctl)" {
+  export SSH_EXEC_UFW_CHECK_RC=0  # paquet + service + statut + regles OK
+  run hardening_configure_ufw
+  [ "${status}" -eq 0 ]
+  # Le check a eu lieu
+  grep -q 'ssh_exec: dpkg -s ufw' "${CALL_LOG}"
+  # AUCUNE action de modification
+  ! grep -qE 'ssh_exec: apt-get update( |$)' "${CALL_LOG}"
+  ! grep -q 'ssh_exec: DEBIAN_FRONTEND=noninteractive apt-get install' "${CALL_LOG}"
+  ! grep -q 'ssh_exec: ufw default' "${CALL_LOG}"
+  ! grep -q 'ssh_exec: ufw allow 22/tcp' "${CALL_LOG}"
+  ! grep -q 'ssh_exec: ufw allow from' "${CALL_LOG}"
+  ! grep -q 'ssh_exec: ufw --force enable' "${CALL_LOG}"
+  ! grep -q 'ssh_exec: systemctl enable ufw' "${CALL_LOG}"
+}
+
+@test "Story 2.4 AC3 : la commande de check combine paquet + service + statut + default + allow SSH + regles LAN" {
+  export SSH_EXEC_UFW_CHECK_RC=0
+  run hardening_configure_ufw
+  [ "${status}" -eq 0 ]
+  # Un seul ssh_exec chaine couvre les 8 sous-categories + 30 regles LAN.
+  # Assertion sur les elements critiques (pas les 30 regles LAN pour rester concis) :
+  grep -qE 'ssh_exec: dpkg -s ufw.*systemctl is-active --quiet ufw.*systemctl is-enabled --quiet ufw.*ufw status verbose.*Status: active.*Default: deny.*incoming.*deny.*routed.*ufw status.*22/tcp' "${CALL_LOG}"
+}
+
+@test "Story 2.4 AC3 : la commande de check inclut les 30 regles LAN (port x CIDR)" {
+  export SSH_EXEC_UFW_CHECK_RC=0
+  run hardening_configure_ufw
+  [ "${status}" -eq 0 ]
+  # Le check chaine contient chaque combinaison port x CIDR. Sondage representatif :
+  # 1er port (7878) x 1er CIDR (10.0.0.0/8), dernier port (32400) x dernier CIDR (192.168.0.0/16).
+  grep -qE 'ssh_exec: dpkg -s ufw.*7878/tcp.*ALLOW.*10\\\.0\\\.0\\\.0/8' "${CALL_LOG}"
+  grep -qE 'ssh_exec: dpkg -s ufw.*32400/tcp.*ALLOW.*192\\\.168\\\.0\\\.0/16' "${CALL_LOG}"
+}
+
+@test "Story 2.4 AC3 : check 1 (paquet absent) -> l'action complete est declenchee" {
+  export SSH_EXEC_UFW_CHECK_RC=1
+  run hardening_configure_ufw
+  [ "${status}" -eq 0 ]
+  grep -q 'ssh_exec: DEBIAN_FRONTEND=noninteractive apt-get install -y' "${CALL_LOG}"
+  grep -q 'ssh_exec: ufw --force enable' "${CALL_LOG}"
+}
+
+# ---------------------------------------------------------------------------
+# Story 2.4 AC5 — Echecs : die 1 + suggestion ciblee par etape
+# ---------------------------------------------------------------------------
+
+@test "Story 2.4 AC5 : echec apt-get update -> die 1 + suggestion reseau ; pas d'install" {
+  export SSH_EXEC_UFW_CHECK_RC=1
+  export SSH_EXEC_UFW_UPDATE_RC=1
+  run hardening_configure_ufw
+  [ "${status}" -eq 1 ]
+  [[ "${output}" == *"apt-get update a echoue avant installation ufw"* ]]
+  [[ "${output}" == *"connectivite reseau"* ]]
+  ! grep -q 'ssh_exec: DEBIAN_FRONTEND=noninteractive apt-get install' "${CALL_LOG}"
+}
+
+@test "Story 2.4 AC5 : echec apt-get install ufw -> die 1 + suggestion apt-cache/journalctl ; pas de ufw default" {
+  export SSH_EXEC_UFW_CHECK_RC=1
+  export SSH_EXEC_UFW_INSTALL_RC=1
+  run hardening_configure_ufw
+  [ "${status}" -eq 1 ]
+  [[ "${output}" == *"Installation ufw echouee"* ]]
+  [[ "${output}" == *"apt-cache policy ufw"* ]]
+  [[ "${output}" == *"journalctl -xe"* ]]
+  ! grep -q 'ssh_exec: ufw default' "${CALL_LOG}"
+}
+
+@test "Story 2.4 AC5 : echec ufw default -> die 1 ; pas d'allow 22/tcp" {
+  export SSH_EXEC_UFW_CHECK_RC=1
+  export SSH_EXEC_UFW_DEFAULT_RC=1
+  run hardening_configure_ufw
+  [ "${status}" -eq 1 ]
+  [[ "${output}" == *"Configuration des politiques par defaut UFW echouee"* ]]
+  [[ "${output}" == *"ufw status verbose"* ]]
+  ! grep -q 'ssh_exec: ufw allow 22/tcp' "${CALL_LOG}"
+}
+
+@test "Story 2.4 AC5 (INVARIANT) : echec ufw allow 22/tcp -> die 1 ET PAS de ufw --force enable" {
+  export SSH_EXEC_UFW_CHECK_RC=1
+  export SSH_EXEC_UFW_ALLOW_SSH_RC=1
+  run hardening_configure_ufw
+  [ "${status}" -eq 1 ]
+  [[ "${output}" == *"Autorisation SSH via UFW echouee"* ]]
+  [[ "${output}" == *"ufw allow 22/tcp"* ]]
+  # INVARIANT CRITIQUE ANTI-LOCKOUT : jamais d'enable sans allow 22/tcp
+  grep -q 'ssh_exec: ufw allow 22/tcp' "${CALL_LOG}"
+  ! grep -q 'ssh_exec: ufw --force enable' "${CALL_LOG}"
+  ! grep -q 'ssh_exec: systemctl enable ufw' "${CALL_LOG}"
+}
+
+@test "Story 2.4 AC5 : echec regles LAN (set -e; ufw allow from ...) -> die 1 ; pas de --force enable" {
+  export SSH_EXEC_UFW_CHECK_RC=1
+  export SSH_EXEC_UFW_ALLOW_LAN_RC=1
+  run hardening_configure_ufw
+  [ "${status}" -eq 1 ]
+  [[ "${output}" == *"Ajout des regles UFW LAN echoue"* ]]
+  # L'allow SSH a eu lieu, mais l'enable non (die avant)
+  grep -q 'ssh_exec: ufw allow 22/tcp' "${CALL_LOG}"
+  ! grep -q 'ssh_exec: ufw --force enable' "${CALL_LOG}"
+}
+
+@test "Story 2.4 AC5 : echec ufw --force enable -> die 1 + suggestion journalctl/iptables" {
+  export SSH_EXEC_UFW_CHECK_RC=1
+  export SSH_EXEC_UFW_ENABLE_RC=1
+  run hardening_configure_ufw
+  [ "${status}" -eq 1 ]
+  [[ "${output}" == *"ufw --force enable a echoue"* ]]
+  [[ "${output}" == *"journalctl -u ufw"* ]]
+  [[ "${output}" == *"iptables -L -n -v"* ]]
+  # SSH est autorise (etape 4 passee) : pas de coupure de session
+  grep -q 'ssh_exec: ufw allow 22/tcp' "${CALL_LOG}"
+  # Le systemctl enable ufw n'a pas eu lieu (die avant)
+  ! grep -q 'ssh_exec: systemctl enable ufw' "${CALL_LOG}"
+}
+
+@test "Story 2.4 AC5 : echec systemctl enable ufw -> die 1 + suggestion systemctl status" {
+  export SSH_EXEC_UFW_CHECK_RC=1
+  export SSH_EXEC_UFW_SYSTEMCTL_RC=1
+  run hardening_configure_ufw
+  [ "${status}" -eq 1 ]
+  [[ "${output}" == *"Activation persistance UFW au boot echouee"* ]]
+  [[ "${output}" == *"systemctl status ufw"* ]]
+  # UFW est deja actif (etape 6 passee) : pas de ufw disable pour revenir en arriere
+  grep -q 'ssh_exec: ufw --force enable' "${CALL_LOG}"
+}
+
+@test "Story 2.4 AC5 : SERVER_IP non defini -> message utilise le fallback 'serveur'" {
+  unset SERVER_IP
+  export SSH_EXEC_UFW_CHECK_RC=1
+  export SSH_EXEC_UFW_ENABLE_RC=1
+  run hardening_configure_ufw
+  [ "${status}" -eq 1 ]
+  [[ "${output}" == *"sur serveur"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# Story 2.4 AC6 — Traces log et convention sans accents
+# ---------------------------------------------------------------------------
+
+@test "Story 2.4 AC6 : cas modif ecrit [ACTION] Hardening UFW et [INFO] Hardening UFW : termine" {
+  export SSH_EXEC_UFW_CHECK_RC=1
+  hardening_configure_ufw
+  grep -q '\[ACTION\] Hardening UFW' "${LOG_FILE}"
+  grep -q '\[INFO\] Hardening UFW : termine' "${LOG_FILE}"
+}
+
+@test "Story 2.4 AC6 : cas idempotent ecrit [INFO] Hardening UFW : deja en place" {
+  export SSH_EXEC_UFW_CHECK_RC=0
+  hardening_configure_ufw
+  grep -q '\[INFO\] Hardening UFW : deja en place' "${LOG_FILE}"
+  ! grep -q '\[ACTION\] Hardening UFW' "${LOG_FILE}"
+}
+
+@test "Story 2.4 AC6 : mode verbose affiche le marqueur idempotent a l'ecran" {
+  export SSH_EXEC_UFW_CHECK_RC=0
+  VERBOSE=1 run hardening_configure_ufw
+  [ "${status}" -eq 0 ]
+  [[ "${output}" == *"[INFO] Hardening UFW : deja en place"* ]]
+}
+
+@test "Story 2.4 AC6 : mode verbose affiche le marqueur 'termine' du chemin modifiant a l'ecran" {
+  export SSH_EXEC_UFW_CHECK_RC=1
+  VERBOSE=1 run hardening_configure_ufw
+  [ "${status}" -eq 0 ]
+  [[ "${output}" == *"[INFO] Hardening UFW : termine"* ]]
+}
+
+@test "Story 2.4 AC6 : messages sans accents (convention Epic 1)" {
+  export SSH_EXEC_UFW_CHECK_RC=1
+  export SSH_EXEC_UFW_INSTALL_RC=1
+  run hardening_configure_ufw
+  [[ "${output}" == *"echouee"* ]]
+  [[ "${output}" != *"échouée"* ]]
+  [[ "${output}" != *"échoué"* ]]
+}
+
 # ---------------------------------------------------------------------------
 # Contrat module : shebang, header, pas d'eval/ssh direct hors helpers
 # ---------------------------------------------------------------------------
@@ -443,6 +734,10 @@ teardown() {
   declare -F hardening_configure_fail2ban >/dev/null
   declare -F _hardening_check_fail2ban_active >/dev/null
   declare -F _hardening_install_and_configure_fail2ban >/dev/null
+  # Story 2.4 : helpers UFW
+  declare -F hardening_configure_ufw >/dev/null
+  declare -F _hardening_check_ufw_active >/dev/null
+  declare -F _hardening_install_and_configure_ufw >/dev/null
 }
 
 @test "Contrat module : hardening.sh n'appelle pas ssh/scp direct ni eval" {
