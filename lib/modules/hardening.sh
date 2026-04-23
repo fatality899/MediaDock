@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Module: hardening - Durcissement SSH (cle only) + fail2ban (jail sshd) + UFW (firewall) + helpers futurs
+# Module: hardening - Durcissement SSH (cle only) + fail2ban (jail sshd) + UFW (firewall) + unattended-upgrades (security-only)
 # Dependances: logging.sh, errors.sh, ssh.sh, utils.sh
 #
 # Point d'entree : hardening_run (appele par install_run via _install_run_step).
@@ -72,14 +72,54 @@
 #       est deja autorise. UFW garde son etat intermediaire pour aider au
 #       diagnostic via `ufw status verbose`.
 #
+#   hardening_configure_auto_updates
+#     - Installe le paquet unattended-upgrades via apt (apt-get update
+#       sans -qq puis install -y avec -o Dpkg::Options::=--force-conf{def,
+#       old} pour un run totalement non-interactif, coherent 2.3/2.4).
+#     - Ecrit un drop-in /etc/apt/apt.conf.d/52mediadock-unattended-upgrades
+#       qui override les defauts du paquet (/etc/apt/apt.conf.d/50unattended-
+#       upgrades) en chargement alphabetique apt.conf.d : prefixe 52 > 50
+#       garantit que nos valeurs gagnent. Scope STRICTEMENT Debian-Security
+#       (2 origines : codename + codename-security, toutes deux avec
+#       label=Debian-Security). Active le scheduling quotidien
+#       (APT::Periodic::Update-Package-Lists=1, Unattended-Upgrade=1) et
+#       desactive explicitement l'autoremove kernel/deps durant un run
+#       unattended (defense en profondeur contre un update security qui
+#       tirerait un autoremove casseur de deps Docker/media).
+#     - Valide la config avec `unattended-upgrade --dry-run --debug` AVANT
+#       l'activation des timers (symetrique `sshd -t` 2.2 / `fail2ban-client
+#       -t` 2.3). Echec de --dry-run : die 1 avec chemin du drop-in dans
+#       le message (drop-in garde sur place cf. §5).
+#     - Active les timers systemd apt-daily.timer et apt-daily-upgrade.timer
+#       en UN SEUL `systemctl enable --now` (atomique + idempotent). Les
+#       deux timers sont installes par le paquet `apt` lui-meme, pas par
+#       `unattended-upgrades`, donc toujours presents sur Debian 13 standard.
+#     - Idempotent : source de verite = etat EFFECTIF du serveur (paquet
+#       installe + 2 timers actifs+enable + 3 valeurs apt-config dump
+#       conformes dont label=Debian-Security present dans Origins-Pattern),
+#       PAS la presence du drop-in MediaDock. Respecte un admin qui aurait
+#       configure l'equivalent ailleurs (ex: /etc/apt/apt.conf.d/20auto-
+#       upgrades via debconf, ou un autre drop-in admin).
+#     - Pas de rollback destructif sur echec (coherent 2.3 §5 / 2.4 §5) :
+#       le drop-in garde son etat intermediaire pour aider au diagnostic
+#       (cat /etc/apt/apt.conf.d/52mediadock-unattended-upgrades + journalctl
+#       -u unattended-upgrades). Aucune manipulation de sshd, fail2ban,
+#       UFW : 0 risque de lockout/coupure SSH par cette story.
+#     - Pas d'Automatic-Reboot (defaut paquet = false, non override) :
+#       une seedbox qui reboote au milieu d'un download torrent = download
+#       corrompu. L'admin qui veut activer peut poser un drop-in
+#       /etc/apt/apt.conf.d/53admin-reboot-window.conf dedie.
+#
 # Helpers prives :
 #   _hardening_check_ssh_hardened, _hardening_write_ssh_drop_in,
 #   _hardening_check_fail2ban_active, _hardening_install_and_configure_fail2ban,
-#   _hardening_check_ufw_active, _hardening_install_and_configure_ufw.
+#   _hardening_check_ufw_active, _hardening_install_and_configure_ufw,
+#   _hardening_check_unattended_active, _hardening_install_and_configure_unattended.
 #
 # Story 2.2 : voir _bmad-output/implementation-artifacts/2-2-hardening-*.md.
 # Story 2.3 : voir _bmad-output/implementation-artifacts/2-3-protection-*.md.
 # Story 2.4 : voir _bmad-output/implementation-artifacts/2-4-firewall-*.md.
+# Story 2.5 : voir _bmad-output/implementation-artifacts/2-5-mises-*.md.
 
 # Variables privees au module. Pas de `readonly` : casserait un second
 # sourcing dans le meme process (cf. deferred-work.md, defer 2-1).
@@ -134,6 +174,53 @@ _HARDENING_UFW_LAN_CIDRS=(10.0.0.0/8 172.16.0.0/12 192.168.0.0/16)
 #   7575 Homarr            | 8888 Gluetun control | 8096 Emby/Jellyfin
 #   32400 Plex
 _HARDENING_UFW_SERVICE_PORTS=(7878 8989 9696 8080 5055 8191 7575 8888 8096 32400)
+
+# Story 2.5 : drop-in unattended-upgrades. Numerote 52 > 50 pour override
+# le /etc/apt/apt.conf.d/50unattended-upgrades du paquet upstream en
+# chargement alphabetique. Un admin qui voudrait customiser peut poser
+# un drop-in 53admin-*.conf - le notre ne verrouille pas la customisation.
+_HARDENING_UNATTENDED_DROP_IN="/etc/apt/apt.conf.d/52mediadock-unattended-upgrades"
+
+# Contenu du drop-in. Single quote bash AUTOUR de la constante : empeche
+# l'expansion de ${distro_codename} cote client (qui serait vide/absent).
+# Cette chaine est transmise TELLE QUELLE au serveur via stdin de `cat > tmp`
+# - ssh_exec ne voit pas ${distro_codename} comme variable bash. Cote serveur,
+# python-apt / unattended-upgrade substitue ${distro_codename} au runtime
+# via /etc/os-release (Debian 13 -> trixie). Le test AC1 verifie bien que
+# le littéral ${distro_codename} apparait dans le drop-in, PAS sa valeur.
+#
+# Les 2 lignes Origins-Pattern couvrent les deux suites security Debian :
+#   codename=trixie,label=Debian-Security          (main repo label security)
+#   codename=trixie-security,label=Debian-Security (suite dediee)
+# Defaut 50unattended-upgrades fait aussi ces 2 lignes - on les reproduit
+# pour etre explicites et autonomes.
+#
+# Remove-Unused-{Kernel-Packages,Dependencies} "false" : defense en profondeur
+# contre un autoremove silencieux qui pourrait casser des deps Docker/media
+# pendant un run unattended. Defaut paquet pour Kernel = true, on override.
+# shellcheck disable=SC2016 # ${distro_codename} est intentionnellement littéral (expanse cote serveur par python-apt).
+_HARDENING_UNATTENDED_CONFIG='// MediaDock unattended-upgrades - genere par mediadock install (Story 2.5)
+// Ne pas editer manuellement : ce fichier est gere par MediaDock.
+// Charge apres 50unattended-upgrades (ordre alphabetique apt.conf.d) donc
+// override les defauts du paquet. Scope security-only strict.
+
+// Scheduling : refresh index quotidien + run unattended quotidien.
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+
+// Origins strictement security - override du defaut 50unattended-upgrades.
+// Note : ${distro_codename} est expanse par unattended-upgrade au runtime
+// (via python-apt + /etc/os-release). Sur Debian 13 : trixie.
+Unattended-Upgrade::Origins-Pattern {
+    "origin=Debian,codename=${distro_codename},label=Debian-Security";
+    "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+};
+
+// Defense en profondeur : aucun autoremove silencieux durant un run
+// unattended. Bloque tout autoremove declenche par une update security
+// qui supprimerait une dep Docker/media inopinement.
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "false";
+Unattended-Upgrade::Remove-Unused-Dependencies "false";'
 
 # Commande de check : la source de verite est `sshd -T` (configuration
 # effective), PAS la presence du drop-in (AC3). Accepte PermitRootLogin
@@ -425,19 +512,139 @@ hardening_configure_ufw() {
     'Hardening UFW'
 }
 
+# Story 2.5 : commande de check unattended-upgrades. Source de verite =
+# etat EFFECTIF du serveur (AC3), PAS la presence du drop-in MediaDock.
+# 10 dimensions verifiees en UN SEUL ssh_exec chaine (session ControlMaster
+# mutualisee, latence ~50ms total) :
+#
+#   1. Paquet installe                   : dpkg -s unattended-upgrades
+#   2. Timer apt-daily actif             : systemctl is-active apt-daily.timer
+#   3. Timer apt-daily enable au boot    : systemctl is-enabled apt-daily.timer
+#   4. Timer apt-daily-upgrade actif     : systemctl is-active apt-daily-upgrade.timer
+#   5. Timer apt-daily-upgrade enable    : systemctl is-enabled apt-daily-upgrade.timer
+#   6. APT::Periodic::Unattended-Upgrade = "1"            : apt-config dump --format %v%n
+#   7. APT::Periodic::Update-Package-Lists = "1"          : apt-config dump --format %v%n
+#   8. Origins-Pattern inclut Debian-Security             : apt-config dump | grep -q
+#   9. Remove-Unused-Kernel-Packages = "false"            : apt-config dump --format %v%n
+#  10. Remove-Unused-Dependencies = "false"               : apt-config dump --format %v%n
+#
+# Ordre court-circuit : dpkg -s d'abord (le moins couteux, evite de poursuivre
+# si paquet absent) ; apt-config dump en dernier (plus lourd, parse toute la
+# config apt.conf.d). apt-config dump est insensible a la locale (format
+# machine-readable) donc pas de LC_ALL=C contrairement a UFW.
+#
+# Check 8 (label=Debian-Security) : condition LACHE intentionnelle. Un admin
+# qui aurait pose au moins une ligne label=Debian-Security via un autre
+# drop-in est considere conforme. Le test strict security-only (AC2) s'appuie
+# sur l'effet runtime via unattended-upgrade --dry-run --debug, pas sur ce
+# check d'idempotence.
+#
+# Checks 9-10 (Remove-Unused-* = "false") : symetrie check/action - l'action
+# ecrit ces 2 directives dans le drop-in (defense en profondeur anti-autoremove
+# pendant un run unattended), le check les verifie. Sans ces 2 sous-checks, un
+# admin ou un drop-in concurrent qui flip l'une a "true" resterait invisible :
+# ensure_state reporterait conforme au prochain run et la defense en profondeur
+# serait silencieusement perdue. Decision revue post code review (2026-04-23)
+# au prix d'une legere deviation spec §3 qui n'enumerait que 3 apt-config dumps.
+_hardening_check_unattended_active() {
+  # shellcheck disable=SC2016 # $() est expanse cote serveur, pas cote client.
+  ssh_exec 'dpkg -s unattended-upgrades >/dev/null 2>&1 && systemctl is-active --quiet apt-daily.timer && systemctl is-enabled --quiet apt-daily.timer && systemctl is-active --quiet apt-daily-upgrade.timer && systemctl is-enabled --quiet apt-daily-upgrade.timer && [ "$(apt-config dump APT::Periodic::Unattended-Upgrade --format %v%n 2>/dev/null)" = "1" ] && [ "$(apt-config dump APT::Periodic::Update-Package-Lists --format %v%n 2>/dev/null)" = "1" ] && apt-config dump Unattended-Upgrade::Origins-Pattern 2>/dev/null | grep -q "label=Debian-Security" && [ "$(apt-config dump Unattended-Upgrade::Remove-Unused-Kernel-Packages --format %v%n 2>/dev/null)" = "false" ] && [ "$(apt-config dump Unattended-Upgrade::Remove-Unused-Dependencies --format %v%n 2>/dev/null)" = "false" ]'
+}
+
+# Story 2.5 : action unattended-upgrades. 5 etapes gardees chacune par
+# `if ! ssh_exec ; then die 1` (pas de dependance a pipefail, coherent
+# 2.2/2.3/2.4). Pattern d'ecriture atomique du drop-in identique 2.2/2.3
+# (tmp + chmod 644 + mv -f). Pas de rollback destructif sur echec
+# (coherent 2.3 §5 / 2.4 §5) : drop-in conserve pour diagnostic.
+#
+# Ordre etape 4 (dry-run) AVANT etape 5 (enable --now timers) : symetrique
+# sshd -t avant reload (2.2) et fail2ban-client -t avant reload (2.3).
+# Echec de --dry-run = timers jamais actives, comportement seedbox intact.
+_hardening_install_and_configure_unattended() {
+  local tmp_path="${_HARDENING_UNATTENDED_DROP_IN}.tmp-$$"
+
+  # 1. Mise a jour index apt. Pas de -qq (coherent 2.3 §4 / 2.4 §4 :
+  #    conserver les warnings depot signe expire / miroir down / NO_PUBKEY
+  #    comme signaux de securite).
+  if ! ssh_exec "apt-get update"; then
+    die 1 "apt-get update a echoue avant installation unattended-upgrades" \
+      "Verifiez la connectivite reseau du serveur ${SERVER_IP:-serveur}"
+  fi
+
+  # 2. Installation idempotente (apt court-circuite si deja installe).
+  #    DEBIAN_FRONTEND=noninteractive + --force-conf{def,old} : couvre
+  #    tout prompt debconf futur ou conflit sur fichier de conf existant
+  #    (le paquet cree /etc/apt/apt.conf.d/50unattended-upgrades par defaut).
+  if ! ssh_exec "DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold unattended-upgrades"; then
+    die 1 "Installation unattended-upgrades echouee" \
+      "Verifiez 'apt-cache policy unattended-upgrades' et 'journalctl -xe' sur ${SERVER_IP:-serveur}"
+  fi
+
+  # 3. Ecriture atomique du drop-in (chmod AVANT mv : pas de fenetre avec
+  #    permissions laxistes). Nettoyage best-effort du tmp sur echec.
+  #    Le contenu _HARDENING_UNATTENDED_CONFIG contient litteralement
+  #    ${distro_codename} - expansion au runtime par unattended-upgrade
+  #    (python-apt + /etc/os-release), PAS cote bash ni cote ssh_exec
+  #    (stdin transmis tel quel).
+  if ! printf '%s\n' "${_HARDENING_UNATTENDED_CONFIG}" \
+      | ssh_exec "cat > ${tmp_path} && chmod 644 ${tmp_path} && mv -f ${tmp_path} ${_HARDENING_UNATTENDED_DROP_IN}"; then
+    ssh_exec "rm -f ${tmp_path}" \
+      || log_warn "Nettoyage du tmp drop-in auto-updates echoue sur ${SERVER_IP:-serveur}"
+    die 1 "Ecriture du drop-in unattended-upgrades echouee" \
+      "Verifiez les permissions ou la connectivite SSH vers ${SERVER_IP:-serveur}"
+  fi
+
+  # 4. Validation pre-apply : unattended-upgrade --dry-run --debug parse
+  #    la config apt.conf finale (tous drop-ins agreges) ET teste la
+  #    requete des origines. Symetrique sshd -t (2.2) / fail2ban-client -t
+  #    (2.3). Echec = drop-in conserve sur place (coherent 2.3 §5 / 2.4 §5)
+  #    + die 1 avec chemin explicite pour que l'admin sache ou regarder.
+  #    Pas de reload apt : la config apt.conf est relue a chaque invocation.
+  if ! ssh_exec "unattended-upgrade --dry-run --debug >/dev/null 2>&1"; then
+    die 1 "unattended-upgrade --dry-run --debug a detecte une config invalide (drop-in : ${_HARDENING_UNATTENDED_DROP_IN})" \
+      "Verifiez '${_HARDENING_UNATTENDED_DROP_IN}', 'unattended-upgrade --dry-run --debug' et 'journalctl -u unattended-upgrades' sur ${SERVER_IP:-serveur}"
+  fi
+
+  # 5. Activation des timers systemd apt-daily*. Les deux timers en UN
+  #    SEUL appel systemctl (atomique + idempotent). enable --now : enable
+  #    pour persistance au boot + start immediat. Si les timers sont deja
+  #    actifs/enable (cas Debian 13 standard ou le paquet apt a deja enable
+  #    les timers), systemctl no-op sans erreur.
+  if ! ssh_exec "systemctl enable --now apt-daily.timer apt-daily-upgrade.timer"; then
+    die 1 "Activation des timers apt-daily* echouee (systemctl enable --now)" \
+      "Verifiez 'systemctl status apt-daily.timer apt-daily-upgrade.timer' et 'journalctl -u apt-daily-upgrade' sur ${SERVER_IP:-serveur}"
+  fi
+}
+
+# Configure unattended-upgrades : scope strictement Debian-Security (2 origines
+# codename + codename-security), timers apt-daily* actifs et enable au boot,
+# Remove-Unused-{Kernel-Packages,Dependencies} a false pour defense en
+# profondeur (pas d'autoremove silencieux durant un run unattended). Idempotent
+# via ensure_state qui verifie l'etat effectif (paquet + 2 timers + 3 valeurs
+# apt-config dump) avant toute action. Pas d'Automatic-Reboot (laisser le
+# defaut paquet false : seedbox ne reboote PAS au milieu d'un download torrent).
+hardening_configure_auto_updates() {
+  ensure_state \
+    '_hardening_check_unattended_active' \
+    '_hardening_install_and_configure_unattended' \
+    'Hardening auto-updates'
+}
+
 # Orchestre le hardening : SSH d'abord (story 2.2), puis fail2ban (story
-# 2.3), puis UFW (story 2.4). L'ordre compte : sshd doit etre en mode
-# cle-only AVANT que fail2ban ne protege la nouvelle config ; fail2ban
-# doit etre actif AVANT que UFW --force enable n'active le filtrage (pour
-# que le gatekeeper brute-force soit deja en place quand le firewall
-# restrictif entre en vigueur). auto-updates arrive dans 2.5 - son appel
-# sera ajoute ici. `_install_run_step` attend un return 0 explicite :
-# aucun traitement d'erreur supplementaire necessaire ici, `die` depuis
-# les helpers fait exit avec code propage.
+# 2.3), puis UFW (story 2.4), puis auto-updates (story 2.5 - clot l'epic
+# hardening). L'ordre compte : sshd doit etre en mode cle-only AVANT que
+# fail2ban ne protege la nouvelle config ; fail2ban doit etre actif AVANT
+# que UFW --force enable n'active le filtrage (pour que le gatekeeper
+# brute-force soit deja en place quand le firewall restrictif entre en
+# vigueur) ; auto-updates arrive en dernier car aucun autre helper n'en
+# depend et il n'a aucun impact sur SSH/f2b/UFW en cours.
+# `_install_run_step` attend un return 0 explicite : aucun traitement
+# d'erreur supplementaire necessaire ici, `die` depuis les helpers fait
+# exit avec code propage.
 hardening_run() {
   hardening_configure_ssh
   hardening_configure_fail2ban
   hardening_configure_ufw
-  # TODO Story 2.5 : hardening_configure_auto_updates
+  hardening_configure_auto_updates
   return 0
 }

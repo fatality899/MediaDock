@@ -1,20 +1,24 @@
 #!/usr/bin/env bats
-# Tests unitaires — Module hardening (Stories 2.2 + 2.3 + 2.4)
+# Tests unitaires — Module hardening (Stories 2.2 + 2.3 + 2.4 + 2.5)
 #
 # Strategie : sourcer hardening.sh en isolation avec ssh_exec stube,
 # pour valider hardening_configure_ssh (idempotence, ecriture + reload,
 # rollback sur echec sshd -t, traces log), hardening_configure_fail2ban
 # (idempotence effective, install + drop-in + enable + reload, die sans
-# rollback sur echec reload, cablage hardening_run) ET hardening_configure_ufw
-# (idempotence, 7 etapes install + regles LAN, invariant allow 22/tcp AVANT
-# --force enable, cablage hardening_run a 3 helpers) sans serveur SSH reel.
+# rollback sur echec reload), hardening_configure_ufw (idempotence, 7
+# etapes install + regles LAN, invariant allow 22/tcp AVANT --force enable)
+# ET hardening_configure_auto_updates (idempotence via etat effectif, 5
+# etapes install + drop-in + dry-run + enable timers, pas de rollback
+# destructif, cablage hardening_run a 4 helpers), sans serveur SSH reel.
 #
 # Persistance via fichier CALL_LOG : les tests avec `run` executent en
 # sous-shell, les variables ne survivent pas mais un fichier si. Les
 # codes de retour du stub sont configurables via variables d'env
 # SSH_EXEC_*_RC (permet de simuler sshd -T conforme / non conforme,
 # sshd -t valide / invalide, paquet fail2ban absent / valeurs non
-# conformes, paquet ufw absent / regles UFW en echec, etc.).
+# conformes, paquet ufw absent / regles UFW en echec, paquet unattended
+# absent / dry-run KO / enable timers KO, etc.). Capture de stdin du stub
+# via CAT_STDIN_LOG pour verifier le contenu du drop-in UU (Story 2.5).
 
 setup() {
   _ORIG_HOME="${HOME:-}"
@@ -28,6 +32,13 @@ setup() {
   CALL_LOG="${TEST_HOME}/calls.log"
   : > "${CALL_LOG}"
   export CALL_LOG
+
+  # Story 2.5 : capture du stdin transmis au stub ssh_exec sur les commandes
+  # `cat > ...`. Permet de verifier le contenu EXACT du drop-in UU envoye au
+  # serveur (tests AC1 3.6 : littéral ${distro_codename} + 5 directives).
+  CAT_STDIN_LOG="${TEST_HOME}/cat_stdin.log"
+  : > "${CAT_STDIN_LOG}"
+  export CAT_STDIN_LOG
 
   # Dependances reelles : logging + errors + utils (ensure_state).
   # shellcheck source=../../lib/core/logging.sh
@@ -72,20 +83,56 @@ setup() {
   export SSH_EXEC_UFW_ENABLE_RC=0       # ufw --force enable
   export SSH_EXEC_UFW_SYSTEMCTL_RC=0    # systemctl enable ufw
 
+  # Stub unattended-upgrades (Story 2.5) : defaut check echoue → action.
+  # Patterns UU places AVANT UFW dans le case pour eviter les collisions
+  # (ex: `apt-get install ... unattended-upgrades` doit matcher UU avant
+  # que `apt-get install ... ufw` ne fasse fallback sur UFW). Collision
+  # `apt-get update` partagee UFW+F2B+UU : priorite UU_UPDATE_RC → UFW_UPDATE_RC
+  # → F2B_UPDATE_RC (premier non-nul gagne).
+  export SSH_EXEC_UU_CHECK_RC=1         # dpkg -s unattended-upgrades && ... (check chaine UU)
+  export SSH_EXEC_UU_UPDATE_RC=0        # apt-get update (priorise sur UFW/F2B si !=0)
+  export SSH_EXEC_UU_INSTALL_RC=0       # apt-get install -y ... unattended-upgrades
+  export SSH_EXEC_UU_CAT_RC=0           # cat > /etc/apt/apt.conf.d/...tmp-$$ && chmod && mv
+  export SSH_EXEC_UU_DRYRUN_RC=0        # unattended-upgrade --dry-run --debug
+  export SSH_EXEC_UU_TIMERS_RC=0        # systemctl enable --now apt-daily.timer apt-daily-upgrade.timer
+  export SSH_EXEC_UU_RM_RC=0            # rm -f /etc/apt/apt.conf.d/...tmp (cleanup echec etape 3)
+
   # Stub ssh_exec : log la commande dans CALL_LOG et retourne un code
-  # configurable selon le motif detecte. Ordre de matching critique :
-  #   1. UFW d'abord (le check UFW commence par `dpkg -s ufw` - unique)
-  #   2. Fail2ban ensuite
-  #   3. SSH en dernier
-  # Patterns UFW places AVANT f2b pour eviter les collisions (ex:
-  # `systemctl is-active --quiet ufw` ne matche PAS le pattern f2b
-  # `systemctl is-active --quiet fail2ban` mais on garde l'ordre strict
-  # par souci de coherence avec la convention UFW-first.
+  # configurable selon le motif detecte. Ordre de matching critique
+  # (convention Story 2.5 §9.3) :
+  #   1. UU d'abord (patterns specifiques unattended-upgrades)
+  #   2. UFW
+  #   3. Fail2ban
+  #   4. SSH en dernier
+  #   5. Fallback
+  # Patterns UU places en tete pour eviter les collisions (ex:
+  # `apt-get install ... unattended-upgrades` matche UU avant que UFW/F2B
+  # ne prennent la main). Collision `apt-get update` partagee 3 modules :
+  # priorite UU_UPDATE_RC → UFW_UPDATE_RC → F2B_UPDATE_RC (premier non-nul).
+  #
+  # Capture stdin : quand la commande matche `*"cat > "*`, on consomme
+  # stdin et on le persiste dans CAT_STDIN_LOG pour verifier le contenu
+  # du drop-in transmis au serveur (tests AC1 Story 2.5).
   ssh_exec() {
     local cmd="$*"
     printf 'ssh_exec: %s\n' "${cmd}" >> "${CALL_LOG}"
+
+    # Capture stdin pour les commandes `cat > ...` (Story 2.5 AC1 3.6).
+    # Meme si le test ne pipe rien, le `cat` consomme juste un stdin vide.
+    if [[ "${cmd}" == *"cat > "* ]]; then
+      cat >> "${CAT_STDIN_LOG}"
+    fi
+
     case "${cmd}" in
-      # --- UFW (plus specifiques, ordre critique : check -> install -> default -> allow 22/tcp -> allow from -> enable -> systemctl enable ufw) ---
+      # --- unattended-upgrades (Story 2.5, places en tete) ---
+      *"dpkg -s unattended-upgrades"*)        return "${SSH_EXEC_UU_CHECK_RC}" ;;
+      *"apt-get install"*"unattended-upgrades"*) return "${SSH_EXEC_UU_INSTALL_RC}" ;;
+      *"cat > /etc/apt/apt.conf.d/"*)         return "${SSH_EXEC_UU_CAT_RC}" ;;
+      *"unattended-upgrade --dry-run"*)       return "${SSH_EXEC_UU_DRYRUN_RC}" ;;
+      *"systemctl enable --now apt-daily"*)   return "${SSH_EXEC_UU_TIMERS_RC}" ;;
+      *"rm -f /etc/apt/apt.conf.d/"*)         return "${SSH_EXEC_UU_RM_RC}" ;;
+
+      # --- UFW (Story 2.4) ---
       *"dpkg -s ufw"*)                          return "${SSH_EXEC_UFW_CHECK_RC}" ;;
       *"apt-get install"*"ufw"*)                return "${SSH_EXEC_UFW_INSTALL_RC}" ;;
       *"ufw default"*)                          return "${SSH_EXEC_UFW_DEFAULT_RC}" ;;
@@ -96,8 +143,11 @@ setup() {
 
       # --- Fail2ban ---
       *"dpkg -s fail2ban"*)                 return "${SSH_EXEC_F2B_CHECK_RC}" ;;
-      # apt-get update partage UFW/F2B : UFW_UPDATE_RC priorise si non-nul.
+      # apt-get update partage UU+UFW+F2B : priorite UU → UFW → F2B (premier non-nul).
       *"apt-get update"*)
+        if [ "${SSH_EXEC_UU_UPDATE_RC:-0}" -ne 0 ]; then
+          return "${SSH_EXEC_UU_UPDATE_RC}"
+        fi
         if [ "${SSH_EXEC_UFW_UPDATE_RC:-0}" -ne 0 ]; then
           return "${SSH_EXEC_UFW_UPDATE_RC}"
         fi
@@ -124,13 +174,15 @@ setup() {
 teardown() {
   rm -rf "${TEST_HOME}"
   export HOME="${_ORIG_HOME}"
-  unset _ORIG_HOME MEDIADOCK_DIR VERBOSE CALL_LOG SERVER_IP
+  unset _ORIG_HOME MEDIADOCK_DIR VERBOSE CALL_LOG CAT_STDIN_LOG SERVER_IP
   unset SSH_EXEC_SSHD_T_RC SSH_EXEC_SSHD_VALIDATE_RC SSH_EXEC_WRITE_RC SSH_EXEC_RELOAD_RC SSH_EXEC_RM_RC
   unset SSH_EXEC_F2B_CHECK_RC SSH_EXEC_F2B_UPDATE_RC SSH_EXEC_F2B_INSTALL_RC
   unset SSH_EXEC_F2B_CAT_RC SSH_EXEC_F2B_ENABLE_RC SSH_EXEC_F2B_TEST_RC SSH_EXEC_F2B_RELOAD_RC SSH_EXEC_F2B_RM_RC
   unset SSH_EXEC_UFW_CHECK_RC SSH_EXEC_UFW_UPDATE_RC SSH_EXEC_UFW_INSTALL_RC
   unset SSH_EXEC_UFW_DEFAULT_RC SSH_EXEC_UFW_ALLOW_SSH_RC SSH_EXEC_UFW_ALLOW_LAN_RC
   unset SSH_EXEC_UFW_ENABLE_RC SSH_EXEC_UFW_SYSTEMCTL_RC
+  unset SSH_EXEC_UU_CHECK_RC SSH_EXEC_UU_UPDATE_RC SSH_EXEC_UU_INSTALL_RC
+  unset SSH_EXEC_UU_CAT_RC SSH_EXEC_UU_DRYRUN_RC SSH_EXEC_UU_TIMERS_RC SSH_EXEC_UU_RM_RC
 }
 
 # ---------------------------------------------------------------------------
@@ -232,29 +284,40 @@ teardown() {
 }
 
 # ---------------------------------------------------------------------------
-# Story 2.4 AC4 — hardening_run orchestre ssh -> fail2ban -> ufw, dans cet ordre
-# (etend l'ancien Story 2.3 AC4 a 3 helpers)
+# Story 2.5 AC4 — hardening_run orchestre ssh -> fail2ban -> ufw -> auto_updates
+# (etend le Story 2.4 AC4 a 4 helpers, clot l'epic hardening : aucun TODO 2.5)
 # ---------------------------------------------------------------------------
 
-@test "Story 2.4 AC4 : hardening_run appelle ssh puis fail2ban puis ufw, dans cet ordre" {
-  # Stubbe les trois helpers pour tracer l'ordre d'invocation
-  hardening_configure_ssh()      { echo "hardening_configure_ssh" >> "${CALL_LOG}"; }
-  hardening_configure_fail2ban() { echo "hardening_configure_fail2ban" >> "${CALL_LOG}"; }
-  hardening_configure_ufw()      { echo "hardening_configure_ufw" >> "${CALL_LOG}"; }
+@test "Story 2.5 AC4 : hardening_run appelle ssh puis fail2ban puis ufw puis auto_updates, dans cet ordre" {
+  # Stubbe les quatre helpers pour tracer l'ordre d'invocation
+  hardening_configure_ssh()          { echo "hardening_configure_ssh" >> "${CALL_LOG}"; }
+  hardening_configure_fail2ban()     { echo "hardening_configure_fail2ban" >> "${CALL_LOG}"; }
+  hardening_configure_ufw()          { echo "hardening_configure_ufw" >> "${CALL_LOG}"; }
+  hardening_configure_auto_updates() { echo "hardening_configure_auto_updates" >> "${CALL_LOG}"; }
   run hardening_run
   [ "${status}" -eq 0 ]
   grep -q '^hardening_configure_ssh$' "${CALL_LOG}"
   grep -q '^hardening_configure_fail2ban$' "${CALL_LOG}"
   grep -q '^hardening_configure_ufw$' "${CALL_LOG}"
-  # Ordre strict : SSH -> fail2ban -> UFW (anti-lockout : UFW apres f2b)
-  local ssh_line f2b_line ufw_line
+  grep -q '^hardening_configure_auto_updates$' "${CALL_LOG}"
+  # Ordre strict : SSH -> fail2ban -> UFW -> auto_updates
+  local ssh_line f2b_line ufw_line uu_line
   ssh_line=$(grep -n '^hardening_configure_ssh$' "${CALL_LOG}" | cut -d: -f1)
   f2b_line=$(grep -n '^hardening_configure_fail2ban$' "${CALL_LOG}" | cut -d: -f1)
   ufw_line=$(grep -n '^hardening_configure_ufw$' "${CALL_LOG}" | cut -d: -f1)
+  uu_line=$(grep -n '^hardening_configure_auto_updates$' "${CALL_LOG}" | cut -d: -f1)
   [ "${ssh_line}" -lt "${f2b_line}" ]
   [ "${f2b_line}" -lt "${ufw_line}" ]
+  [ "${ufw_line}" -lt "${uu_line}" ]
   # Le message stub de 2.1 ne doit plus apparaitre
   [[ "${output}" != *"Hardening — stub"* ]]
+}
+
+@test "Story 2.5 AC4 : aucun '# TODO Story 2.5' ne subsiste dans hardening.sh" {
+  local hardening_sh="${PROJECT_ROOT}/lib/modules/hardening.sh"
+  # Epic 2 hardening clos : plus de TODO 2.5 apres implementation.
+  ! grep -qE '^[^#]*#[[:space:]]*TODO[[:space:]]+Story[[:space:]]+2\.5' "${hardening_sh}"
+  ! grep -qE '#[[:space:]]*TODO[[:space:]]+Story[[:space:]]+2\.5[[:space:]]*:[[:space:]]*hardening_configure_auto_updates' "${hardening_sh}"
 }
 
 # ---------------------------------------------------------------------------
@@ -718,6 +781,248 @@ teardown() {
   [[ "${output}" != *"échoué"* ]]
 }
 
+# ===========================================================================
+# STORY 2.5 — Mises a jour de securite automatiques (unattended-upgrades)
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Story 2.5 AC1 — Cas nominal : check echoue -> 5 etapes (update, install,
+# cat/chmod/mv drop-in, dry-run, enable --now timers) dans l'ordre
+# ---------------------------------------------------------------------------
+
+@test "Story 2.5 AC1 : hardening_configure_auto_updates execute les 5 etapes dans l'ordre" {
+  export SSH_EXEC_UU_CHECK_RC=1  # etat non conforme -> action
+  run hardening_configure_auto_updates
+  [ "${status}" -eq 0 ]
+  # Les 5 etapes attendues apparaissent dans CALL_LOG
+  grep -qE 'ssh_exec: apt-get update( |$)' "${CALL_LOG}"
+  grep -q 'ssh_exec: DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold unattended-upgrades' "${CALL_LOG}"
+  grep -q 'ssh_exec: cat > /etc/apt/apt.conf.d/52mediadock-unattended-upgrades.tmp-' "${CALL_LOG}"
+  grep -q 'ssh_exec: unattended-upgrade --dry-run --debug' "${CALL_LOG}"
+  grep -q 'ssh_exec: systemctl enable --now apt-daily.timer apt-daily-upgrade.timer' "${CALL_LOG}"
+  # Ordre strict : update < install < cat/mv < dry-run < enable timers
+  local update_line install_line cat_line dryrun_line timers_line
+  update_line=$(grep -nE 'ssh_exec: apt-get update( |$)' "${CALL_LOG}" | head -1 | cut -d: -f1)
+  install_line=$(grep -n 'ssh_exec: DEBIAN_FRONTEND=noninteractive apt-get install -y .*unattended-upgrades' "${CALL_LOG}" | cut -d: -f1)
+  cat_line=$(grep -n 'ssh_exec: cat > /etc/apt/apt.conf.d/52mediadock-unattended-upgrades.tmp-' "${CALL_LOG}" | cut -d: -f1)
+  dryrun_line=$(grep -n 'ssh_exec: unattended-upgrade --dry-run --debug' "${CALL_LOG}" | cut -d: -f1)
+  timers_line=$(grep -n 'ssh_exec: systemctl enable --now apt-daily.timer apt-daily-upgrade.timer' "${CALL_LOG}" | cut -d: -f1)
+  [ "${update_line}" -lt "${install_line}" ]
+  [ "${install_line}" -lt "${cat_line}" ]
+  [ "${cat_line}" -lt "${dryrun_line}" ]
+  [ "${dryrun_line}" -lt "${timers_line}" ]
+}
+
+@test "Story 2.5 AC1 : apt-get install utilise --force-conf{def,old} (heritage patch 2.3)" {
+  export SSH_EXEC_UU_CHECK_RC=1
+  run hardening_configure_auto_updates
+  [ "${status}" -eq 0 ]
+  grep -q '\-o Dpkg::Options::=--force-confdef' "${CALL_LOG}"
+  grep -q '\-o Dpkg::Options::=--force-confold' "${CALL_LOG}"
+}
+
+@test "Story 2.5 AC1 : apt-get update est invoque SANS -qq (heritage patch 2.3)" {
+  export SSH_EXEC_UU_CHECK_RC=1
+  run hardening_configure_auto_updates
+  [ "${status}" -eq 0 ]
+  ! grep -q 'ssh_exec: apt-get update -qq' "${CALL_LOG}"
+  grep -qE 'ssh_exec: apt-get update( |$)' "${CALL_LOG}"
+}
+
+@test "Story 2.5 AC1 : le drop-in cible /etc/apt/apt.conf.d/52mediadock-unattended-upgrades avec chmod 644 et mv -f atomique" {
+  export SSH_EXEC_UU_CHECK_RC=1
+  run hardening_configure_auto_updates
+  [ "${status}" -eq 0 ]
+  grep -qE 'ssh_exec: cat > /etc/apt/apt\.conf\.d/52mediadock-unattended-upgrades\.tmp-[0-9]+ && chmod 644 /etc/apt/apt\.conf\.d/52mediadock-unattended-upgrades\.tmp-[0-9]+ && mv -f /etc/apt/apt\.conf\.d/52mediadock-unattended-upgrades\.tmp-[0-9]+ /etc/apt/apt\.conf\.d/52mediadock-unattended-upgrades' "${CALL_LOG}"
+}
+
+@test "Story 2.5 AC1 : le contenu du drop-in transmis contient les 5 directives attendues" {
+  export SSH_EXEC_UU_CHECK_RC=1
+  run hardening_configure_auto_updates
+  [ "${status}" -eq 0 ]
+  # Les 5 directives (2 x APT::Periodic, 1 x Origins-Pattern avec 2 origines security, 2 x Remove-Unused-* false)
+  grep -qF 'APT::Periodic::Update-Package-Lists "1";' "${CAT_STDIN_LOG}"
+  grep -qF 'APT::Periodic::Unattended-Upgrade "1";' "${CAT_STDIN_LOG}"
+  grep -qF 'origin=Debian,codename=${distro_codename},label=Debian-Security' "${CAT_STDIN_LOG}"
+  grep -qF 'origin=Debian,codename=${distro_codename}-security,label=Debian-Security' "${CAT_STDIN_LOG}"
+  grep -qF 'Unattended-Upgrade::Remove-Unused-Kernel-Packages "false";' "${CAT_STDIN_LOG}"
+  grep -qF 'Unattended-Upgrade::Remove-Unused-Dependencies "false";' "${CAT_STDIN_LOG}"
+}
+
+@test "Story 2.5 AC1 : le drop-in contient LITTERALEMENT \${distro_codename} (pas d'expansion cote client)" {
+  export SSH_EXEC_UU_CHECK_RC=1
+  run hardening_configure_auto_updates
+  [ "${status}" -eq 0 ]
+  # Le littéral ${distro_codename} DOIT apparaitre (expansion au runtime par python-apt cote serveur).
+  grep -qF '${distro_codename}' "${CAT_STDIN_LOG}"
+}
+
+@test "Story 2.5 AC1 : activation timers en UN SEUL systemctl enable --now (pas 2 appels separes)" {
+  export SSH_EXEC_UU_CHECK_RC=1
+  run hardening_configure_auto_updates
+  [ "${status}" -eq 0 ]
+  # Un seul `systemctl enable --now` contient les DEUX timers.
+  grep -qE 'ssh_exec: systemctl enable --now apt-daily\.timer apt-daily-upgrade\.timer' "${CALL_LOG}"
+  # Compte : exactement 1 invocation de `systemctl enable --now apt-daily`.
+  [ "$(grep -cE 'ssh_exec: systemctl enable --now apt-daily' "${CALL_LOG}")" -eq 1 ]
+}
+
+# ---------------------------------------------------------------------------
+# Story 2.5 AC2 / AC3 — Idempotence : check effectif conforme -> aucune action
+# ---------------------------------------------------------------------------
+
+@test "Story 2.5 AC2/AC3 : si l'etat effectif est deja conforme, aucune action (pas d'apt/cat/dry-run/enable)" {
+  export SSH_EXEC_UU_CHECK_RC=0  # paquet + timers + apt-config dump conformes
+  run hardening_configure_auto_updates
+  [ "${status}" -eq 0 ]
+  # Le check a eu lieu
+  grep -q 'ssh_exec: dpkg -s unattended-upgrades' "${CALL_LOG}"
+  # AUCUNE action de modification
+  ! grep -qE 'ssh_exec: apt-get update( |$)' "${CALL_LOG}"
+  ! grep -q 'ssh_exec: DEBIAN_FRONTEND=noninteractive apt-get install' "${CALL_LOG}"
+  ! grep -q 'ssh_exec: cat > /etc/apt/apt.conf.d/' "${CALL_LOG}"
+  ! grep -q 'ssh_exec: unattended-upgrade --dry-run' "${CALL_LOG}"
+  ! grep -q 'ssh_exec: systemctl enable --now apt-daily' "${CALL_LOG}"
+}
+
+@test "Story 2.5 AC3 : le check combine paquet + 2 timers actifs + 2 timers enable + 5 apt-config dump" {
+  export SSH_EXEC_UU_CHECK_RC=0
+  run hardening_configure_auto_updates
+  [ "${status}" -eq 0 ]
+  # UN SEUL ssh_exec chaine couvre les 10 sous-checks (latence minimale).
+  grep -qE 'ssh_exec: dpkg -s unattended-upgrades.*systemctl is-active --quiet apt-daily\.timer.*systemctl is-enabled --quiet apt-daily\.timer.*systemctl is-active --quiet apt-daily-upgrade\.timer.*systemctl is-enabled --quiet apt-daily-upgrade\.timer.*apt-config dump APT::Periodic::Unattended-Upgrade.*apt-config dump APT::Periodic::Update-Package-Lists.*apt-config dump Unattended-Upgrade::Origins-Pattern.*label=Debian-Security.*apt-config dump Unattended-Upgrade::Remove-Unused-Kernel-Packages.*apt-config dump Unattended-Upgrade::Remove-Unused-Dependencies' "${CALL_LOG}"
+  # Symetrie check/action : les 2 Remove-Unused-* ecrits par l'action sont verifies par le check avec valeur attendue "false".
+  grep -qF '[ "$(apt-config dump Unattended-Upgrade::Remove-Unused-Kernel-Packages --format %v%n 2>/dev/null)" = "false" ]' "${CALL_LOG}"
+  grep -qF '[ "$(apt-config dump Unattended-Upgrade::Remove-Unused-Dependencies --format %v%n 2>/dev/null)" = "false" ]' "${CALL_LOG}"
+  # Exactement 1 seul ssh_exec pour le check (pas de check multi-appels).
+  [ "$(grep -c 'ssh_exec: dpkg -s unattended-upgrades' "${CALL_LOG}")" -eq 1 ]
+}
+
+@test "Story 2.5 AC3 : check 1 (paquet absent) -> l'action complete est declenchee" {
+  export SSH_EXEC_UU_CHECK_RC=1
+  run hardening_configure_auto_updates
+  [ "${status}" -eq 0 ]
+  grep -q 'ssh_exec: DEBIAN_FRONTEND=noninteractive apt-get install -y .*unattended-upgrades' "${CALL_LOG}"
+  grep -q 'ssh_exec: systemctl enable --now apt-daily.timer apt-daily-upgrade.timer' "${CALL_LOG}"
+}
+
+# ---------------------------------------------------------------------------
+# Story 2.5 AC5 — Echecs : die 1 + suggestion ciblee par etape
+# ---------------------------------------------------------------------------
+
+@test "Story 2.5 AC5 : echec apt-get update -> die 1 + suggestion reseau ; pas d'install" {
+  export SSH_EXEC_UU_CHECK_RC=1
+  export SSH_EXEC_UU_UPDATE_RC=1
+  run hardening_configure_auto_updates
+  [ "${status}" -eq 1 ]
+  [[ "${output}" == *"apt-get update a echoue avant installation unattended-upgrades"* ]]
+  [[ "${output}" == *"connectivite reseau"* ]]
+  ! grep -q 'ssh_exec: DEBIAN_FRONTEND=noninteractive apt-get install' "${CALL_LOG}"
+}
+
+@test "Story 2.5 AC5 : echec apt-get install -> die 1 + suggestion apt-cache/journalctl ; pas de cat > drop-in" {
+  export SSH_EXEC_UU_CHECK_RC=1
+  export SSH_EXEC_UU_INSTALL_RC=1
+  run hardening_configure_auto_updates
+  [ "${status}" -eq 1 ]
+  [[ "${output}" == *"Installation unattended-upgrades echouee"* ]]
+  [[ "${output}" == *"apt-cache policy unattended-upgrades"* ]]
+  [[ "${output}" == *"journalctl -xe"* ]]
+  ! grep -q 'ssh_exec: cat > /etc/apt/apt.conf.d/' "${CALL_LOG}"
+}
+
+@test "Story 2.5 AC5 : echec ecriture drop-in -> rm -f du tmp + die 1 ; pas de dry-run" {
+  export SSH_EXEC_UU_CHECK_RC=1
+  export SSH_EXEC_UU_CAT_RC=1
+  run hardening_configure_auto_updates
+  [ "${status}" -eq 1 ]
+  [[ "${output}" == *"Ecriture du drop-in unattended-upgrades echouee"* ]]
+  # Nettoyage tmp (best-effort, pattern pid-suffix)
+  grep -q 'ssh_exec: rm -f /etc/apt/apt.conf.d/52mediadock-unattended-upgrades.tmp-' "${CALL_LOG}"
+  # Dry-run / enable timers non effectues
+  ! grep -q 'ssh_exec: unattended-upgrade --dry-run' "${CALL_LOG}"
+  ! grep -q 'ssh_exec: systemctl enable --now apt-daily' "${CALL_LOG}"
+}
+
+@test "Story 2.5 AC5 : echec unattended-upgrade --dry-run -> die 1 + chemin drop-in + drop-in conserve + pas de enable timers" {
+  export SSH_EXEC_UU_CHECK_RC=1
+  export SSH_EXEC_UU_DRYRUN_RC=1
+  run hardening_configure_auto_updates
+  [ "${status}" -eq 1 ]
+  [[ "${output}" == *"unattended-upgrade --dry-run --debug a detecte une config invalide"* ]]
+  # Chemin du drop-in explicite (§5 diagnostic : garde le fichier + cite-le)
+  [[ "${output}" == *"/etc/apt/apt.conf.d/52mediadock-unattended-upgrades"* ]]
+  [[ "${output}" == *"journalctl -u unattended-upgrades"* ]]
+  # Le dry-run a bien eu lieu, mais enable timers NON (die avant)
+  grep -q 'ssh_exec: unattended-upgrade --dry-run --debug' "${CALL_LOG}"
+  ! grep -q 'ssh_exec: systemctl enable --now apt-daily' "${CALL_LOG}"
+  # Le drop-in reste en place (§5 : pas de rollback destructif sur echec dry-run)
+  ! grep -qE 'ssh_exec: rm -f /etc/apt/apt\.conf\.d/52mediadock-unattended-upgrades$' "${CALL_LOG}"
+}
+
+@test "Story 2.5 AC5 : echec systemctl enable --now apt-daily* -> die 1 + suggestion systemctl status / journalctl" {
+  export SSH_EXEC_UU_CHECK_RC=1
+  export SSH_EXEC_UU_TIMERS_RC=1
+  run hardening_configure_auto_updates
+  [ "${status}" -eq 1 ]
+  [[ "${output}" == *"Activation des timers apt-daily* echouee"* ]]
+  [[ "${output}" == *"systemctl status apt-daily.timer apt-daily-upgrade.timer"* ]]
+  [[ "${output}" == *"journalctl -u apt-daily-upgrade"* ]]
+  # Le dry-run est passe (etape 4), le drop-in est en place (§5 pas de rollback)
+  grep -q 'ssh_exec: unattended-upgrade --dry-run --debug' "${CALL_LOG}"
+  ! grep -qE 'ssh_exec: rm -f /etc/apt/apt\.conf\.d/52mediadock-unattended-upgrades$' "${CALL_LOG}"
+}
+
+@test "Story 2.5 AC5 : SERVER_IP non defini -> message utilise le fallback 'serveur'" {
+  unset SERVER_IP
+  export SSH_EXEC_UU_CHECK_RC=1
+  export SSH_EXEC_UU_DRYRUN_RC=1
+  run hardening_configure_auto_updates
+  [ "${status}" -eq 1 ]
+  [[ "${output}" == *"sur serveur"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# Story 2.5 AC6 — Traces log et convention sans accents
+# ---------------------------------------------------------------------------
+
+@test "Story 2.5 AC6 : cas modif ecrit [ACTION] Hardening auto-updates et [INFO] termine" {
+  export SSH_EXEC_UU_CHECK_RC=1
+  hardening_configure_auto_updates
+  grep -q '\[ACTION\] Hardening auto-updates' "${LOG_FILE}"
+  grep -q '\[INFO\] Hardening auto-updates : termine' "${LOG_FILE}"
+}
+
+@test "Story 2.5 AC6 : cas idempotent ecrit [INFO] Hardening auto-updates : deja en place" {
+  export SSH_EXEC_UU_CHECK_RC=0
+  hardening_configure_auto_updates
+  grep -q '\[INFO\] Hardening auto-updates : deja en place' "${LOG_FILE}"
+  ! grep -q '\[ACTION\] Hardening auto-updates' "${LOG_FILE}"
+}
+
+@test "Story 2.5 AC6 : mode verbose affiche le marqueur idempotent a l'ecran" {
+  export SSH_EXEC_UU_CHECK_RC=0
+  VERBOSE=1 run hardening_configure_auto_updates
+  [ "${status}" -eq 0 ]
+  [[ "${output}" == *"[INFO] Hardening auto-updates : deja en place"* ]]
+}
+
+@test "Story 2.5 AC6 : mode verbose affiche le marqueur 'termine' du chemin modifiant a l'ecran" {
+  export SSH_EXEC_UU_CHECK_RC=1
+  VERBOSE=1 run hardening_configure_auto_updates
+  [ "${status}" -eq 0 ]
+  [[ "${output}" == *"[INFO] Hardening auto-updates : termine"* ]]
+}
+
+@test "Story 2.5 AC6 : messages sans accents (convention Epic 1)" {
+  export SSH_EXEC_UU_CHECK_RC=1
+  export SSH_EXEC_UU_INSTALL_RC=1
+  run hardening_configure_auto_updates
+  [[ "${output}" == *"echouee"* ]]
+  [[ "${output}" != *"échouée"* ]]
+  [[ "${output}" != *"échoué"* ]]
+}
+
 # ---------------------------------------------------------------------------
 # Contrat module : shebang, header, pas d'eval/ssh direct hors helpers
 # ---------------------------------------------------------------------------
@@ -738,6 +1043,10 @@ teardown() {
   declare -F hardening_configure_ufw >/dev/null
   declare -F _hardening_check_ufw_active >/dev/null
   declare -F _hardening_install_and_configure_ufw >/dev/null
+  # Story 2.5 : helpers unattended-upgrades
+  declare -F hardening_configure_auto_updates >/dev/null
+  declare -F _hardening_check_unattended_active >/dev/null
+  declare -F _hardening_install_and_configure_unattended >/dev/null
 }
 
 @test "Contrat module : hardening.sh n'appelle pas ssh/scp direct ni eval" {
